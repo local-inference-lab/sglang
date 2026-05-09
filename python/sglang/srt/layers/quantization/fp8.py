@@ -576,13 +576,28 @@ class Fp8LinearMethod(LinearMethodBase):
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
+            swizzled_scale_u8 = block_scale_interleave(
+                scale_u8.contiguous()
+            ).contiguous()
+            if envs.SGLANG_MXFP8_CUTLASS_DISCARD_CANONICAL_SCALE.get():
+                # Low-memory inference mode: reuse the canonical scale parameter
+                # for CUTLASS' runtime layout. This disables online weight updates
+                # because checkpoint reload expects canonical scale shapes.
+                copy_or_rebind_param(layer, "weight_scale_inv", swizzled_scale_u8)
+                layer.weight_scale_inv.format_ue8m0 = True
+                layer.weight_scale_inv_is_cutlass_interleaved = True
+                if hasattr(layer, "weight_scale_inv_swizzled"):
+                    delattr(layer, "weight_scale_inv_swizzled")
+                return
+
             # block_scale_interleave may pad and/or reshape scales,
             # so store swizzled scales separately to keep weight update working
             copy_or_rebind_param(
                 layer,
                 "weight_scale_inv_swizzled",
-                block_scale_interleave(scale_u8.contiguous()).contiguous(),
+                swizzled_scale_u8,
             )
+            layer.weight_scale_inv_is_cutlass_interleaved = False
         else:
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
@@ -736,7 +751,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_mxfp8:
             if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
-                weight_scale = layer.weight_scale_inv_swizzled
+                if getattr(layer, "weight_scale_inv_is_cutlass_interleaved", False):
+                    weight_scale = layer.weight_scale_inv
+                else:
+                    weight_scale = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):

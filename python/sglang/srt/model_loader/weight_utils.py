@@ -233,6 +233,31 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+def _merge_packed_modules_mapping(
+    config: Dict[str, Any], packed_modules_mapping: Dict[str, List[str]]
+) -> None:
+    quantization_config = config.get("quantization")
+    nested_mapping = None
+    if isinstance(quantization_config, dict):
+        nested_mapping = quantization_config.get("packed_modules_mapping")
+
+    merged_mapping = {}
+    for mapping in (
+        nested_mapping,
+        config.get("packed_modules_mapping"),
+        packed_modules_mapping,
+    ):
+        if mapping:
+            merged_mapping.update(mapping)
+
+    if not merged_mapping:
+        return
+
+    config["packed_modules_mapping"] = merged_mapping
+    if isinstance(quantization_config, dict):
+        quantization_config["packed_modules_mapping"] = merged_mapping
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
@@ -258,7 +283,7 @@ def get_quant_config(
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
-        hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        _merge_packed_modules_mapping(hf_quant_config, packed_modules_mapping)
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
@@ -319,7 +344,7 @@ def get_quant_config(
                 for key in config["quantization"]["exclude_modules"]
             ]
             config["quantization"]["exclude_modules"] = exclude_modules
-        config["packed_modules_mapping"] = packed_modules_mapping
+        _merge_packed_modules_mapping(config, packed_modules_mapping)
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path

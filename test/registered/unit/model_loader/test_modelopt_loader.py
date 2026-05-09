@@ -14,6 +14,8 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
@@ -637,6 +639,32 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
 
+    def test_explicit_quantized_layers_mixed_precision_uses_modelopt_mixed(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = MagicMock()
+        model_config.hf_config.model_type = "generic_model"
+        model_config.hf_config.architectures = ["GenericForCausalLM"]
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.self_attn.qkv_proj": {
+                            "quant_algo": "FP8_PB_WO",
+                            "weight_block_size": [128, 128],
+                        },
+                        "model.layers.0.mlp.experts.0.up_proj": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_mixed")
+
     def test_mixed_precision_override_does_not_hijack_w4afp8(self):
         self.assertIsNone(
             ModelOptMixedPrecisionConfig.override_quantization_method(
@@ -683,6 +711,28 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             quant_config._resolve_quant_algo("model.layers.2.mixer.qkv_proj"),
             "FP8",
         )
+
+    def test_mixed_precision_fp8_pb_wo_uses_block_fp8(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.qkv_proj": {
+                        "quant_algo": "FP8_PB_WO",
+                        "weight_block_size": [128, 128],
+                    },
+                },
+            }
+        )
+        layer = LinearBase(16, 16)
+
+        quant_method = quant_config.get_quant_method(
+            layer, "model.layers.0.self_attn.qkv_proj"
+        )
+
+        self.assertIsInstance(quant_method, Fp8LinearMethod)
+        self.assertEqual(quant_config.block_fp8_config.weight_block_size, [128, 128])
+        self.assertEqual(quant_config.block_fp8_config.activation_scheme, "dynamic")
 
 
 if __name__ == "__main__":

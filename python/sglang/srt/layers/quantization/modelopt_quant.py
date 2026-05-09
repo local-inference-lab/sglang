@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     is_blackwell_supported,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -69,6 +70,9 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.models.utils import WeightsMapper
+
+MODEL_OPT_BLOCK_FP8_WEIGHT_ONLY_ALGOS = {"FP8_PB_WO"}
+MODEL_OPT_MXFP8_WEIGHT_ONLY_ALGOS = {"MXFP8"}
 
 fp4_quantize = None
 try:
@@ -285,7 +289,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
     ):
         super().__init__()
-        self.packed_modules_mapping = packed_modules_mapping
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
 
@@ -613,11 +617,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
+        block_fp8_config: Optional[Fp8Config],
+        mxfp8_config: Optional[Fp8Config],
         nvfp4_config: "ModelOptFp4Config",
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
+        self.block_fp8_config = block_fp8_config
+        self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
 
     @classmethod
@@ -688,13 +696,67 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         if group_size is None:
             group_size = 16
 
-        packed_modules_mapping = config.get("packed_modules_mapping")
+        block_fp8_weight_block_sizes = {
+            tuple(layer_info.get("weight_block_size", [128, 128]))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper()
+            in MODEL_OPT_BLOCK_FP8_WEIGHT_ONLY_ALGOS
+        }
+        if len(block_fp8_weight_block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION FP8_PB_WO layers must use one weight_block_size, "
+                f"but got {sorted(block_fp8_weight_block_sizes)}."
+            )
+        mxfp8_group_sizes = {
+            layer_info.get("group_size", 32)
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper()
+            in MODEL_OPT_MXFP8_WEIGHT_ONLY_ALGOS
+        }
+        if len(mxfp8_group_sizes) > 1 or (
+            mxfp8_group_sizes and next(iter(mxfp8_group_sizes)) != 32
+        ):
+            raise ValueError(
+                "MIXED_PRECISION MXFP8 layers must use group_size=32, "
+                f"but got {sorted(mxfp8_group_sizes)}."
+            )
+
+        quantization_section = config.get("quantization")
+        nested_packed_modules_mapping = None
+        if isinstance(quantization_section, dict):
+            nested_packed_modules_mapping = quantization_section.get(
+                "packed_modules_mapping"
+            )
+        packed_modules_mapping = {}
+        if nested_packed_modules_mapping:
+            packed_modules_mapping.update(nested_packed_modules_mapping)
+        if config.get("packed_modules_mapping"):
+            packed_modules_mapping.update(config["packed_modules_mapping"])
         fp8_config = ModelOptFp8Config(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_algo,
             exclude_modules=[],
             packed_modules_mapping=packed_modules_mapping,
         )
+        block_fp8_config = None
+        if block_fp8_weight_block_sizes:
+            block_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                ignored_layers=[],
+                weight_block_size=list(next(iter(block_fp8_weight_block_sizes))),
+                packed_modules_mapping=packed_modules_mapping,
+            )
+        mxfp8_config = None
+        if mxfp8_group_sizes:
+            mxfp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=True,
+                activation_scheme="dynamic",
+                ignored_layers=[],
+                weight_block_size=[1, 32],
+                packed_modules_mapping=packed_modules_mapping,
+                use_mxfp8=True,
+            )
         nvfp4_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True,
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -709,6 +771,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
+            block_fp8_config=block_fp8_config,
+            mxfp8_config=mxfp8_config,
             nvfp4_config=nvfp4_config,
         )
 
@@ -761,6 +825,16 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo in MODEL_OPT_BLOCK_FP8_WEIGHT_ONLY_ALGOS:
+                if self.block_fp8_config is None:
+                    raise ValueError(
+                        f"{quant_algo} layer {prefix} requires block FP8 config."
+                    )
+                return Fp8LinearMethod(self.block_fp8_config)
+            if quant_algo in MODEL_OPT_MXFP8_WEIGHT_ONLY_ALGOS:
+                if self.mxfp8_config is None:
+                    raise ValueError(f"{quant_algo} layer {prefix} requires MXFP8 config.")
+                return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             return UnquantizedLinearMethod()

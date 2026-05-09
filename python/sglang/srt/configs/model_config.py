@@ -995,6 +995,21 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
+            quantized_layers = json_quant_configs.get("quantized_layers")
+            if isinstance(quantized_layers, dict) and quantized_layers:
+                layer_algos = {
+                    str(layer_info.get("quant_algo", "")).upper()
+                    for layer_info in quantized_layers.values()
+                    if isinstance(layer_info, dict)
+                }
+                if layer_algos and layer_algos <= {
+                    "FP8",
+                    "NVFP4",
+                    "FP8_PB_WO",
+                    "MXFP8",
+                }:
+                    return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
+
             architectures = getattr(self.hf_config, "architectures", []) or []
             if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
                 arch.startswith("NemotronH") for arch in architectures
@@ -1190,35 +1205,44 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
-                    self.quantization in compatible_quantization_methods
-                    and quant_method
-                    in compatible_quantization_methods[self.quantization]
-                )
-                if is_compatible:
-                    # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if
-                    # HF config says "modelopt" - they are compatible
+                if self.quantization == "modelopt" and quant_method.startswith(
+                    "modelopt_"
+                ):
                     logger.info(
-                        f"Using CLI-specified quantization ({self.quantization}) which is "
-                        f"compatible with HF config quant_method ({quant_method})."
-                    )
-                elif self.is_draft_model:
-                    # Allow auto-detection of quantization from checkpoint for draft model
-                    # only if the CLI quantization is not compatible
-                    logger.info(
-                        f"Draft model quantization ({quant_method}) differs from "
-                        f"main model quantization ({self.quantization}). "
-                        f"Using draft model's detected quantization: {quant_method}"
+                        f"Using detected ModelOpt quantization ({quant_method}) "
+                        f"from model config."
                     )
                     self.quantization = quant_method
                 else:
-                    raise ValueError(
-                        "Quantization method specified in the model config "
-                        f"({quant_method}) does not match the quantization "
-                        f"method specified in the `quantization` argument "
-                        f"({self.quantization})."
+                    # Check if the CLI-specified quantization is compatible with HF config's quant_method
+                    is_compatible = (
+                        self.quantization in compatible_quantization_methods
+                        and quant_method
+                        in compatible_quantization_methods[self.quantization]
                     )
+                    if is_compatible:
+                        # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if
+                        # HF config says "modelopt" - they are compatible
+                        logger.info(
+                            f"Using CLI-specified quantization ({self.quantization}) which is "
+                            f"compatible with HF config quant_method ({quant_method})."
+                        )
+                    elif self.is_draft_model:
+                        # Allow auto-detection of quantization from checkpoint for draft model
+                        # only if the CLI quantization is not compatible
+                        logger.info(
+                            f"Draft model quantization ({quant_method}) differs from "
+                            f"main model quantization ({self.quantization}). "
+                            f"Using draft model's detected quantization: {quant_method}"
+                        )
+                        self.quantization = quant_method
+                    else:
+                        raise ValueError(
+                            "Quantization method specified in the model config "
+                            f"({quant_method}) does not match the quantization "
+                            f"method specified in the `quantization` argument "
+                            f"({self.quantization})."
+                        )
 
             # Check if the scale_fmt is ue8m0, and warn user if deepgemm is enabled for non-ue8m0 models on blackwell
             self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
