@@ -93,6 +93,9 @@ class CustomAllReduceV2:
 
     @contextmanager
     def capture(self):
+        if self.disabled or not hasattr(self, "obj"):
+            yield
+            return
         try:
             self.obj.set_cuda_graph_capture(True)
             yield

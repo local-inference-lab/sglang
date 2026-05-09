@@ -36,11 +36,8 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-if _is_cuda:
-    try:
-        import deep_gemm
-    except ImportError as e:
-        deep_gemm = e
+deep_gemm: Optional[Any] = None
+_deep_gemm_import_error: Optional[ImportError] = None
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
@@ -74,6 +71,34 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+
+
+def _try_import_deep_gemm():
+    global deep_gemm, _deep_gemm_import_error
+    if deep_gemm is not None:
+        return deep_gemm
+    try:
+        import deep_gemm as deep_gemm_mod
+    except ImportError as e:
+        _deep_gemm_import_error = e
+        return None
+    deep_gemm = deep_gemm_mod
+    return deep_gemm
+
+
+def _require_deep_gemm():
+    deep_gemm_mod = _try_import_deep_gemm()
+    if deep_gemm_mod is not None:
+        return deep_gemm_mod
+
+    raise RuntimeError(
+        "DeepGEMM is required for the CUDA NSA indexer DeepGEMM path. "
+        "Use b12x NSA backends for the b12x indexer path, or install deep_gemm."
+    ) from _deep_gemm_import_error
+
+
+def _get_cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
 class BaseIndexerMetadata(ABC):
@@ -257,7 +282,7 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = _get_cuda_sm_count()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -499,16 +524,17 @@ class Indexer(MultiPlatformOp):
     @staticmethod
     def _use_b12x_indexer(forward_batch: ForwardBatch) -> bool:
         attn_backend = forward_batch.attn_backend
+        b12x_impls = ("b12x", "b12x_mla")
         if forward_batch.forward_mode.is_decode_or_idle():
-            return getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
+            return getattr(attn_backend, "nsa_decode_impl", None) in b12x_impls
         if forward_batch.forward_mode.is_target_verify():
             return (
-                getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
-                or getattr(attn_backend, "nsa_prefill_impl", None) == "b12x"
+                getattr(attn_backend, "nsa_decode_impl", None) in b12x_impls
+                or getattr(attn_backend, "nsa_prefill_impl", None) in b12x_impls
             )
         if forward_batch.forward_mode.is_draft_extend(include_v2=True):
-            return getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
-        return getattr(attn_backend, "nsa_prefill_impl", None) == "b12x"
+            return getattr(attn_backend, "nsa_decode_impl", None) in b12x_impls
+        return getattr(attn_backend, "nsa_prefill_impl", None) in b12x_impls
 
     def _get_b12x_indexer_phantoms(
         self,
@@ -756,6 +782,7 @@ class Indexer(MultiPlatformOp):
                 forward_batch, layer_id, q_fp8, weights, metadata
             )
 
+        deep_gemm_mod = None if _is_hip else _require_deep_gemm()
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
@@ -792,7 +819,7 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                schedule_metadata = deep_gemm_mod.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
@@ -838,7 +865,7 @@ class Indexer(MultiPlatformOp):
                 KVBlockSize=block_kv,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
+            logits = deep_gemm_mod.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
@@ -901,6 +928,7 @@ class Indexer(MultiPlatformOp):
                 forward_batch, layer_id, q_fp8, weights, metadata
             )
 
+        deep_gemm_mod = None if _is_hip else _require_deep_gemm()
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
             assert page_size == 1, "only support page size 1"
@@ -971,7 +999,7 @@ class Indexer(MultiPlatformOp):
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
                 else:
-                    logits = deep_gemm.fp8_mqa_logits(
+                    logits = deep_gemm_mod.fp8_mqa_logits(
                         q_fp8[:q_offset],
                         kv_fp8,
                         weights[:q_offset],
@@ -1021,7 +1049,7 @@ class Indexer(MultiPlatformOp):
                         ke[start:end],
                     )
                 else:
-                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                    logits_chunk = deep_gemm_mod.fp8_mqa_logits(
                         q_fp8[start:end],
                         kv_fp8,
                         weights[start:end],
@@ -1120,6 +1148,7 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
+        deep_gemm_mod = _require_deep_gemm()
         page_size = forward_batch.token_to_kv_pool.page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
@@ -1188,7 +1217,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
             actual_seq_q = torch.cat(actual_seq_q_list, dim=0)
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = deep_gemm_mod.fp8_mqa_logits(
                     q_fp8,
                     kv_fp8,
                     weights,
@@ -1230,7 +1259,7 @@ class Indexer(MultiPlatformOp):
             ke = ks + ke_offset
 
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
+                logits = deep_gemm_mod.fp8_mqa_logits(
                     q_fp8,
                     kv_fp8,
                     weights,

@@ -436,11 +436,18 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    On CUDA, the JIT-compiled v2 implementation is used by default.
+    On CUDA, the JIT-compiled v2 implementation is used by default unless the
+    b12x PCIe oneshot runtime is requested, which is implemented by the legacy
+    CustomAllreduce class.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
     Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
     ``nnodes > 1`` since custom AR is intra-node only.
     """
+    pcie_oneshot_enabled, _ = _get_pcie_oneshot_settings()
+    if _is_cuda and pcie_oneshot_enabled:
+        logger.debug("[AR] Using CustomAllreduce for b12x PCIe oneshot")
+        return CustomAllreduce
+
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import CustomAllReduceV2
 
