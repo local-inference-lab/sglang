@@ -99,6 +99,7 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_flashinfer_trtllm_routed()
             or self.enable_flashinfer_mxfp4_moe
         )
+        self.enable_nvfp4_dispatch = backend.is_flashinfer_cutlass()
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
@@ -113,7 +114,7 @@ class StandardDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        if self.enable_nvfp4_dispatch and should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None

@@ -197,9 +197,7 @@ class CompilerManager:
         if graph_index == num_graphs - 1:
             now = time.time()
             elapsed = now - compilation_start_time
-            if runtime_shape is None:
-                logger.info("Compiling a graph for dynamic shape takes %.2f s", elapsed)
-            else:
+            if runtime_shape is not None:
                 logger.info(
                     "Compiling a graph for shape %s takes %.2f s",
                     runtime_shape,

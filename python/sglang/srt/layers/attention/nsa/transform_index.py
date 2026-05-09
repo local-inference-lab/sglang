@@ -78,6 +78,11 @@ def transform_index_page_table_prefill_fast(
     # TODO(baizhou): can be implemented with another triton kernel
     assert page_size == 1
     result = torch.empty_like(topk_indices, dtype=torch.int32)
+    if len(extend_lens_cpu) != page_table.shape[0]:
+        if page_table.shape[0] == topk_indices.shape[0]:
+            extend_lens_cpu = [1] * page_table.shape[0]
+        else:
+            assert len(extend_lens_cpu) == page_table.shape[0]
     assert len(extend_lens_cpu) == page_table.shape[0]
     offset = 0
     for i, l in enumerate(extend_lens_cpu):
@@ -108,7 +113,7 @@ def transform_index_page_table_decode_ref(
         index=topk_indices.clamp(min=0),
         out=result,
     )
-    result[topk_indices < 0] = -1
+    result.masked_fill_(topk_indices < 0, -1)
     return result
 
 
@@ -120,6 +125,11 @@ def transform_index_page_table_prefill_ref(
 ) -> torch.Tensor:
     assert page_size == 1
     result = torch.empty_like(topk_indices, dtype=torch.int32)
+    if len(extend_lens_cpu) != page_table.shape[0]:
+        if page_table.shape[0] == topk_indices.shape[0]:
+            extend_lens_cpu = [1] * page_table.shape[0]
+        else:
+            assert len(extend_lens_cpu) == page_table.shape[0]
     assert len(extend_lens_cpu) == page_table.shape[0]
     offset = 0
     for i, l in enumerate(extend_lens_cpu):

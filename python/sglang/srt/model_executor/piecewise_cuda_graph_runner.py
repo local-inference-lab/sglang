@@ -469,9 +469,14 @@ class PiecewiseCudaGraphRunner:
                 forward_batch.extend_seq_lens_cpu,
             ):
                 if start_len is not None and start_len < seq_len:
+                    self._log_can_run_reject("extend_logprob_start_lens", forward_batch)
                     return False
         if num_tokens <= self.max_num_tokens:
             return True
+        self._log_can_run_reject(
+            f"num_tokens_exceeds_capture_max:{num_tokens}>{self.max_num_tokens}",
+            forward_batch,
+        )
         return False
 
     def capture(self) -> None:

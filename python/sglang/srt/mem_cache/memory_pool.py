@@ -1979,6 +1979,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         page_indices: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        k_out: torch.Tensor | None = None,
+        s_out: torch.Tensor | None = None,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -2001,6 +2003,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
             seq_len_tensor=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
+            k_out=k_out,
+            s_out=s_out,
         )
 
     def set_index_k_scale_buffer(

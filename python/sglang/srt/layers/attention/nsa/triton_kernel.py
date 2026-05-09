@@ -194,3 +194,59 @@ def get_valid_kv_indices(
         bs,
         topk,
     )
+
+
+@triton.jit
+def _map_ragged_indices_to_kv_rows_kernel(
+    selected_ptr,
+    row_ids_ptr,
+    output_ptr,
+    n_elements: tl.constexpr,
+    row_ids_numel: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    selected = tl.load(selected_ptr + offsets, mask=mask, other=-1)
+    valid = mask & (selected >= 0) & (selected < row_ids_numel)
+    mapped = tl.load(row_ids_ptr + selected, mask=valid, other=-1)
+    tl.store(output_ptr + offsets, mapped, mask=mask)
+
+
+def map_ragged_indices_to_kv_rows(
+    selected_indices: torch.Tensor,
+    row_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if selected_indices.device != row_ids.device or selected_indices.device != output.device:
+        raise ValueError("selected_indices, row_ids, and output must be on the same device")
+    if selected_indices.shape != output.shape:
+        raise ValueError(
+            f"output shape {tuple(output.shape)} must match selected_indices shape {tuple(selected_indices.shape)}"
+        )
+    if selected_indices.dtype != torch.int32:
+        raise TypeError(f"selected_indices must have dtype torch.int32, got {selected_indices.dtype}")
+    if output.dtype != torch.int32:
+        raise TypeError(f"output must have dtype torch.int32, got {output.dtype}")
+    if not selected_indices.is_contiguous():
+        raise ValueError("selected_indices must be contiguous")
+    if not row_ids.is_contiguous():
+        raise ValueError("row_ids must be contiguous")
+    if not output.is_contiguous():
+        raise ValueError("output must be contiguous")
+
+    n_elements = int(selected_indices.numel())
+    if n_elements == 0:
+        return output
+    block_size = 256
+    grid = (triton.cdiv(n_elements, block_size),)
+    _map_ragged_indices_to_kv_rows_kernel[grid](
+        selected_indices,
+        row_ids,
+        output,
+        n_elements,
+        int(row_ids.numel()),
+        BLOCK_SIZE=block_size,
+    )
+    return output

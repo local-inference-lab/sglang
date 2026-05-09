@@ -382,6 +382,228 @@ class VisionTritonAttention(nn.Module):
         return output
 
 
+class VisionB12XAttention(nn.Module):
+    """b12x contiguous varlen multimodal attention."""
+
+    def __init__(
+        self,
+        head_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        softmax_scale: float | None = None,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionB12XAttention is only available for cuda")
+        super().__init__()
+        try:
+            from b12x.attention.contiguous.integration import (
+                allocate_varlen_attention_workspace_for_plan,
+                b12x_varlen_attention_forward,
+                create_varlen_attention_plan,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "b12x multimodal attention backend requires the b12x package"
+            ) from e
+
+        self.head_size = head_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.scale = (
+            softmax_scale
+            if softmax_scale is not None
+            else 1.0 / math.sqrt(self.head_size)
+        )
+        self._create_varlen_attention_plan = create_varlen_attention_plan
+        self._allocate_varlen_attention_workspace_for_plan = (
+            allocate_varlen_attention_workspace_for_plan
+        )
+        self._b12x_varlen_attention_forward = b12x_varlen_attention_forward
+        self._plan_workspace_cache: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+        self._sink_bias_cache: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _normalize_window_size(window_size: Any) -> tuple[int, int]:
+        if window_size is None:
+            return (-1, -1)
+        if isinstance(window_size, int):
+            return (int(window_size), int(window_size))
+        if len(window_size) != 2:
+            raise ValueError(f"window_size must have 2 elements, got {window_size}")
+        return (int(window_size[0]), int(window_size[1]))
+
+    @staticmethod
+    def _device_index(device: torch.device) -> int:
+        return (
+            torch.cuda.current_device()
+            if device.index is None
+            else int(device.index)
+        )
+
+    @staticmethod
+    def _scalar_int(value: Any, name: str) -> int:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(f"{name} must be scalar, got shape {value.shape}")
+            return int(value.item())
+        return int(value)
+
+    def _resolve_cu_seqlens_and_max(
+        self,
+        cu_seqlens: torch.Tensor | SingletonCache | list | None,
+        *,
+        bsz: int,
+        seq_len: int,
+        device: torch.device,
+        max_seqlen: Any,
+    ) -> tuple[torch.Tensor, int]:
+        if isinstance(cu_seqlens, list):
+            if len(cu_seqlens) == 2:
+                resolved_cu_seqlens, resolved_max_seqlen = cu_seqlens
+            elif len(cu_seqlens) == 3:
+                resolved_cu_seqlens, _seq_lens, resolved_max_seqlen = cu_seqlens
+            else:
+                raise RuntimeError(
+                    "b12x cuda-graph cu_seqlens must be [cu, max_len] "
+                    "or [cu, seq_lens, max_len]"
+                )
+        else:
+            resolved_cu_seqlens = resolve_seqlens(
+                cu_seqlens, bsz, seq_len, device=device
+            )
+            resolved_max_seqlen = max_seqlen
+            if resolved_max_seqlen is None:
+                seq_lens = resolved_cu_seqlens[1:] - resolved_cu_seqlens[:-1]
+                resolved_max_seqlen = (
+                    int(seq_lens.max().item()) if seq_lens.numel() else 0
+                )
+
+        if not isinstance(resolved_cu_seqlens, torch.Tensor):
+            raise RuntimeError("b12x attention expects cu_seqlens to be a Tensor")
+
+        if resolved_cu_seqlens.device != device:
+            resolved_cu_seqlens = resolved_cu_seqlens.to(device=device)
+        if resolved_cu_seqlens.dtype != torch.int32:
+            resolved_cu_seqlens = resolved_cu_seqlens.to(dtype=torch.int32)
+        if not resolved_cu_seqlens.is_contiguous():
+            resolved_cu_seqlens = resolved_cu_seqlens.contiguous()
+
+        return resolved_cu_seqlens, self._scalar_int(
+            resolved_max_seqlen, "max_seqlen"
+        )
+
+    def _prepare_sink_bias(self, s_aux: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if s_aux is None:
+            return None
+        if not isinstance(s_aux, torch.Tensor):
+            raise RuntimeError("b12x attention sink bias must be a Tensor")
+        if s_aux.dtype == torch.float32 and s_aux.is_contiguous():
+            return s_aux
+
+        cache = self._sink_bias_cache
+        if (
+            cache is None
+            or cache.shape != s_aux.shape
+            or cache.device != s_aux.device
+        ):
+            cache = torch.empty(
+                tuple(s_aux.shape), dtype=torch.float32, device=s_aux.device
+            )
+            self._sink_bias_cache = cache
+        cache.copy_(s_aux, non_blocking=True)
+        return cache
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+            raise RuntimeError(
+                "b12x multimodal attention expects packed rank-3 q/k/v tensors"
+            )
+        if q.device.type != "cuda":
+            raise RuntimeError("b12x multimodal attention requires CUDA tensors")
+        if q.numel() == 0:
+            return torch.empty_like(q)
+
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and (
+            not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous()
+        ):
+            raise RuntimeError(
+                "b12x cuda-graph attention requires contiguous q/k/v inputs"
+            )
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if not k.is_contiguous():
+            k = k.contiguous()
+        if not v.is_contiguous():
+            v = v.contiguous()
+
+        window_size = self._normalize_window_size(kwargs.get("window_size", (-1, -1)))
+        cu_seqlens, max_seqlen = self._resolve_cu_seqlens_and_max(
+            cu_seqlens,
+            bsz=bsz,
+            seq_len=seq_len,
+            device=q.device,
+            max_seqlen=kwargs.get("max_seqlen", None),
+        )
+        sink_bias = self._prepare_sink_bias(kwargs.get("s_aux", None))
+        scale = softmax_scale if softmax_scale is not None else self.scale
+
+        cache_key = (
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+            tuple(cu_seqlens.shape),
+            self._device_index(q.device),
+            q.dtype,
+            max_seqlen,
+            window_size,
+            sink_bias is not None,
+        )
+        cached = self._plan_workspace_cache.get(cache_key)
+        if cached is None:
+            plan = self._create_varlen_attention_plan(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=False,
+                window_size=window_size,
+                attention_sink_bias=sink_bias,
+            )
+            workspace = self._allocate_varlen_attention_workspace_for_plan(plan)
+            cached = (plan, workspace)
+            self._plan_workspace_cache[cache_key] = cached
+        plan, workspace = cached
+
+        output, _lse = self._b12x_varlen_attention_forward(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            workspace=workspace,
+            plan=plan,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+            window_size=window_size,
+            attention_sink_bias=sink_bias,
+            softmax_scale=scale,
+        )
+        return output
+
+
 class VisionFlash3Attention(nn.Module):
     def __init__(
         self,
@@ -732,6 +954,7 @@ class VisionAscendAttention(nn.Module):
 
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
+    "b12x": VisionB12XAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "fa4": VisionFlash4Attention,

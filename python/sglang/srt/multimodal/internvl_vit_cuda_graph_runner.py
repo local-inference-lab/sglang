@@ -102,7 +102,7 @@ class InternViTCudaGraphRunner:
 
         if override_backend == "triton_attn":
             cu_ws = [cu, cu_kk, max_len]
-        elif override_backend == "fa3":
+        elif override_backend in ("fa3", "b12x"):
             cu_ws = [cu, max_len]
         else:
             raise RuntimeError("Not supported ViT attention backend for InternVL CG")
@@ -123,7 +123,7 @@ class InternViTCudaGraphRunner:
 
         if override_backend == "triton_attn":
             cu_ws = [cu, cu_kk, max_len]
-        elif override_backend == "fa3":
+        elif override_backend in ("fa3", "b12x"):
             cu_ws = [cu, max_len]
         else:
             raise RuntimeError("Not supported ViT attention backend for InternVL CG")

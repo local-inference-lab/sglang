@@ -83,7 +83,7 @@ def verify_single_backend_fused_metadata_copy(
         ref_page_table_1[:, : precomputed.max_seqlen_k].copy_(precomputed.page_indices)
         ref_nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
         ref_nsa_cache_seqlens.copy_(precomputed.nsa_cache_seqlens)
-    elif forward_mode.is_draft_extend():
+    elif forward_mode.is_draft_extend(include_v2=True):
         # Draft extend mode
         rows = precomputed.page_indices.shape[0]
         cols = precomputed.max_seqlen_k
@@ -141,7 +141,7 @@ def verify_single_backend_fused_metadata_copy(
             fused_page_table_1[:, : precomputed.max_seqlen_k],
             ref_page_table_1[:, : precomputed.max_seqlen_k],
         )
-    elif forward_mode.is_draft_extend():
+    elif forward_mode.is_draft_extend(include_v2=True):
         rows = precomputed.page_indices.shape[0]
         cols = precomputed.max_seqlen_k
         check_tensor_equal(
@@ -166,7 +166,9 @@ def verify_single_backend_fused_metadata_copy(
         )
 
     # Compare nsa_seqlens_expanded only for TARGET_VERIFY and DRAFT_EXTEND
-    if forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+    if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+        include_v2=True
+    ):
         size = precomputed.seqlens_expanded_size
         check_tensor_equal(
             "nsa_seqlens_expanded",

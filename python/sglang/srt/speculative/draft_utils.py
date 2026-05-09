@@ -57,6 +57,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
+            "b12x": self._create_b12x_decode_backend,
         }
 
         return self._create_backend(
@@ -83,6 +84,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
+            "b12x": self._create_b12x_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -134,6 +136,12 @@ class DraftBackendFactory:
 
         return TritonMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_b12x_decode_backend(self):
+        raise ValueError(
+            "b12x speculative multi-step decode backend is not implemented; "
+            "use b12x draft extend with topk=1 or choose another draft backend."
         )
 
     def _create_aiter_decode_backend(self):
@@ -234,6 +242,17 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
         return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_b12x_prefill_backend(self):
+        if self.topk != 1:
+            raise ValueError(
+                "b12x draft extend only supports linear EAGLE/MTP "
+                "(--speculative-eagle-topk 1); no fallback backend is used."
+            )
+
+        from sglang.srt.layers.attention.b12x_backend import B12xAttnBackend
+
+        return B12xAttnBackend(self.draft_model_runner)
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend

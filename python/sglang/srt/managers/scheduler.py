@@ -1342,6 +1342,18 @@ class Scheduler(
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
+    def _wait_for_attention_backend_cuda_graph_metadata(self) -> None:
+        if not self.enable_overlap:
+            return
+        model_runner = getattr(self.model_worker, "model_runner", None)
+        attn_backend = getattr(model_runner, "attn_backend", None)
+        get_event = getattr(attn_backend, "get_cuda_graph_metadata_ready_event", None)
+        if get_event is None:
+            return
+        event = get_event()
+        if event is not None:
+            self.schedule_stream.wait_event(event)
+
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
@@ -1854,14 +1866,14 @@ class Scheduler(
             self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
+        requested_max_new_tokens = req.sampling_params.max_new_tokens
+        scheduler_max_new_tokens = min(
+            requested_max_new_tokens
+            if requested_max_new_tokens is not None
+            else 1 << 30,
             self.max_req_len - len(req.origin_input_ids) - 1,
         )
+        req.sampling_params.max_new_tokens = scheduler_max_new_tokens
 
     def _process_and_broadcast_mm_inputs(
         self,
@@ -2999,6 +3011,8 @@ class Scheduler(
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
+
+                self._wait_for_attention_backend_cuda_graph_metadata()
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices

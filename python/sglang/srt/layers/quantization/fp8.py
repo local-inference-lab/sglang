@@ -1663,6 +1663,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_b12x():
+            raise ValueError(
+                "The b12x MoE runner does not support FP8 MoE checkpoints. "
+                "Use a supported MoE runner backend for FP8, such as triton."
+            )
         else:
             # TODO(cwan): refactor other backends
             pass

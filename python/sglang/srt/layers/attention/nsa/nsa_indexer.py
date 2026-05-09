@@ -112,21 +112,43 @@ class BaseIndexerMetadata(ABC):
         """
         Return: seq lens for each batch.
         """
+        raise NotImplementedError
 
     def get_indexer_seq_len(self) -> torch.Tensor:
         """
         Return: seq lens for each batch.
         """
+        raise NotImplementedError
+
+    def get_indexer_seq_lens_sum(self) -> int:
+        """
+        Return: sum of indexer seq lens for the current batch.
+        """
+        raise NotImplementedError
+
+    def get_indexer_max_seq_len(self) -> int:
+        """
+        Return: max of indexer seq lens for the current batch.
+        """
+        raise NotImplementedError
+
+    def get_seq_lens_cpu_list(self) -> List[int]:
+        """
+        Return: per-sequence KV lengths as Python ints.
+        """
+        raise NotImplementedError
 
     def get_nsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
         """
+        raise NotImplementedError
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         """
         Return: batch idx for each token.
         """
+        raise NotImplementedError
 
     @abstractmethod
     def topk_transform(
@@ -159,6 +181,43 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+def _try_b12x_persistent_paged_topk(
+    *,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    page_table_1: Optional[torch.Tensor],
+    topk: int,
+    fused_output: bool,
+) -> Optional[torch.Tensor]:
+    from b12x.integration.nsa_indexer import (
+        run_persistent_topk2048,
+        supports_persistent_topk2048,
+    )
+
+    lengths = lengths.reshape(-1)
+    if not lengths.is_contiguous():
+        lengths = lengths.contiguous()
+
+    persistent_page_table = page_table_1 if fused_output else None
+    if persistent_page_table is not None and not persistent_page_table.is_contiguous():
+        persistent_page_table = persistent_page_table.contiguous()
+
+    if not supports_persistent_topk2048(
+        logits,
+        lengths,
+        topk=topk,
+        page_table_1=persistent_page_table,
+    ):
+        return None
+
+    return run_persistent_topk2048(
+        logits,
+        lengths,
+        page_table_1=persistent_page_table,
+        max_seq_len=int(logits.shape[1]),
+    )
 
 
 class Indexer(MultiPlatformOp):
@@ -243,6 +302,21 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    def enter_torch_compile(self, num_tokens: int):
+        if self.is_torch_compile:
+            return
+
+        self._original_forward_method = self._forward_method
+        # Keep the CUDA indexer path opaque to Dynamo. The b12x/CuTe runtime
+        # uses DLPack and JIT launch plumbing that is not fake-tensor traceable.
+        self._forward_method = torch.compiler.disable(self.forward_cuda)
+        self.is_torch_compile = True
+
+    def forward_native(self, *args, **kwargs):
+        # torch.compile routes MultiPlatformOp modules through forward_native().
+        # The NSA indexer still needs its custom CUDA path in that mode.
+        return self.forward_cuda(*args, **kwargs)
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -266,7 +340,10 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+        ):
             weight = self.weights_proj.weight
             out = torch.empty(
                 (x.shape[0], weight.shape[0]),
@@ -414,9 +491,254 @@ class Indexer(MultiPlatformOp):
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
         # On AMD with in-place RoPE kernels, self-aliasing can occur;
         # skip write-back when src/dst tensors point to a single memory.
-        if src.data_ptr() == dst.data_ptr():
+        # Avoid pointer introspection while Dynamo is tracing.
+        if not torch._dynamo.is_compiling() and src.data_ptr() == dst.data_ptr():
             return
         dst.copy_(src)
+
+    @staticmethod
+    def _use_b12x_indexer(forward_batch: ForwardBatch) -> bool:
+        attn_backend = forward_batch.attn_backend
+        if forward_batch.forward_mode.is_decode_or_idle():
+            return getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
+        if forward_batch.forward_mode.is_target_verify():
+            return (
+                getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
+                or getattr(attn_backend, "nsa_prefill_impl", None) == "b12x"
+            )
+        if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+            return getattr(attn_backend, "nsa_decode_impl", None) == "b12x"
+        return getattr(attn_backend, "nsa_prefill_impl", None) == "b12x"
+
+    def _get_b12x_indexer_phantoms(
+        self,
+        forward_batch: ForwardBatch,
+        q_rows: int,
+    ) -> dict:
+        """Lazily create and cache phantom tensors for stable kernel cache keys."""
+        phantoms = getattr(self, "_b12x_indexer_phantoms", None)
+        if phantoms is not None and phantoms.get("_max_q_rows", 0) >= q_rows:
+            return phantoms
+        from b12x.integration.nsa_indexer import make_nsa_indexer_contract_phantoms
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        # Upper bound on page table width: total KV pool pages.
+        max_pages = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=self.layer_id
+        ).shape[0]
+        max_q = max(q_rows, phantoms.get("_max_q_rows", 0)) if phantoms else q_rows
+        phantoms = make_nsa_indexer_contract_phantoms(
+            max_q_rows=max_q,
+            num_heads=self.n_heads,
+            max_pages=max_pages,
+            page_size=page_size,
+            device=forward_batch.seq_lens.device,
+        )
+        phantoms["_max_q_rows"] = max_q
+        self._b12x_indexer_phantoms = phantoms
+        return phantoms
+
+    def _get_b12x_paged_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from b12x.integration.nsa_indexer import (
+            NSAIndexerPagedDecodeMetadata,
+            sparse_nsa_index_decode_logits_paged,
+        )
+
+        q_offset = min(sum(metadata.get_nsa_extend_len_cpu()), q_fp8.shape[0])
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            seqlens_per_query = metadata.get_seqlens_expanded()[:q_offset]
+        else:
+            seqlens_per_query = metadata.get_seqlens_int32()[:q_offset]
+        if q_offset == 0:
+            return torch.full(
+                (q_fp8.shape[0], self.index_topk),
+                -1,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            )
+        workspace = forward_batch.attn_backend.get_b12x_indexer_paged_workspace(
+            forward_batch=forward_batch,
+        )
+        logits = sparse_nsa_index_decode_logits_paged(
+            q_fp8=q_fp8[:q_offset],
+            weights=weights[:q_offset],
+            index_k_cache=forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            ),
+            metadata=NSAIndexerPagedDecodeMetadata(
+                real_page_table=metadata.get_page_table_64()[:q_offset],
+                cache_seqlens_int32=seqlens_per_query,
+                paged_mqa_schedule_metadata=getattr(
+                    metadata, "paged_mqa_schedule_metadata", None
+                ),
+            ),
+            page_size=forward_batch.token_to_kv_pool.page_size,
+            workspace=workspace,
+        )
+        topk_result = None
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and envs.SGLANG_NSA_B12X_PERSISTENT_TOPK.get()
+        ):
+            fused_output = envs.SGLANG_NSA_FUSE_TOPK.get() and not getattr(
+                metadata, "force_unfused_topk", False
+            )
+            topk_result = _try_b12x_persistent_paged_topk(
+                logits=logits,
+                lengths=seqlens_per_query,
+                page_table_1=metadata.get_page_table_1()[:q_offset],
+                topk=self.index_topk,
+                fused_output=fused_output,
+            )
+
+        topk_kwargs = {}
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            # b12x paged verify/draft-extend currently score against an expanded
+            # per-query page table. The fused paged top-k transform therefore needs
+            # a matching expanded query grouping instead of the batch-grouped
+            # extend-style cu_seqlens_q stored in the attention metadata.
+            topk_kwargs["cu_seqlens_q_cumsum"] = metadata.attn_metadata.nsa_cu_seqlens_q[
+                : q_offset + 1
+            ]
+        if topk_result is None:
+            topk_result = metadata.topk_transform(
+                logits, self.index_topk, **topk_kwargs
+            )
+        if q_offset < q_fp8.shape[0]:
+            pad_len = q_fp8.shape[0] - q_offset
+            padding = torch.full(
+                (pad_len, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
+            )
+            topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
+
+    def _get_b12x_ragged_topk(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from b12x.integration.nsa_indexer import (
+            NSAIndexerExtendLogitsMetadata,
+            sparse_nsa_index_extend_tiled_topk,
+        )
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+        if _is_hip:
+            raise NotImplementedError(
+                "b12x ragged extend logits currently target the CUDA/DeepGEMM contract only"
+            )
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        assert page_size == 64, "only support page size 64"
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(-1)
+
+        block_tables = metadata.get_page_table_64()
+        ks, ke = metadata.get_indexer_kvcache_range()
+        seq_len_sum = metadata.get_indexer_seq_lens_sum()
+        max_seq_len = metadata.get_indexer_max_seq_len()
+        q_offset = ks.shape[0]
+        token_nums = q_fp8.shape[0]
+        device = q_fp8.device
+        topk_result = torch.full(
+            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
+        )
+        if q_offset == 0:
+            return topk_result
+        attn_backend = forward_batch.attn_backend
+        workspace = attn_backend._get_b12x_workspace(
+            mode="extend",
+            v_head_dim=int(attn_backend.model_v_head_dim),
+        )
+        gather_k_out, gather_s_out = workspace.get_indexer_gather_outputs(
+            row_count=seq_len_sum
+        )
+        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+            layer_id,
+            metadata.get_indexer_seq_len(),
+            block_tables,
+            seq_len_sum,
+            max_seq_len,
+            k_out=gather_k_out,
+            s_out=gather_s_out,
+        )
+        if _is_fp8_fnuz:
+            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+        else:
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
+        kv_fp8 = (k_fp8, k_scale)
+        topk_values_out, topk_indices_out = workspace.get_indexer_extend_topk_buffers(
+            row_count=q_offset
+        )
+        candidate_values_out = candidate_indices_out = None
+        if getattr(workspace, "indexer_extend_candidate_values", None) is not None:
+            candidate_values_out, candidate_indices_out = (
+                workspace.get_indexer_extend_candidate_buffers()
+            )
+
+        raw_topk_result = sparse_nsa_index_extend_tiled_topk(
+            q_fp8=q_fp8[:q_offset],
+            weights=weights[:q_offset],
+            kv_fp8=kv_fp8,
+            metadata=NSAIndexerExtendLogitsMetadata(
+                k_start=ks[:q_offset],
+                k_end=ke[:q_offset],
+            ),
+            topk=self.index_topk,
+            contract_phantoms=workspace.get_indexer_contract_phantoms(),
+            tile_logits=workspace.get_indexer_extend_tile_logits(),
+            lengths=workspace.get_indexer_extend_lengths(row_count=q_offset),
+            output_values=topk_values_out,
+            output_indices=topk_indices_out,
+            candidate_values=candidate_values_out,
+            candidate_indices=candidate_indices_out,
+        )
+        topk_result[:q_offset] = raw_topk_result
+        return topk_result
+
+    def _build_b12x_trivial_extend_topk(
+        self,
+        x_meta: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        seqlens_expanded = metadata.get_seqlens_expanded()
+        dummy_logits = torch.zeros(
+            seqlens_expanded.shape[0],
+            self.index_topk,
+            dtype=torch.float32,
+            device=x_meta.device,
+        )
+        topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
+        if x_meta.shape[0] <= topk_result.shape[0]:
+            return topk_result[: x_meta.shape[0]]
+
+        padding = torch.full(
+            (x_meta.shape[0] - topk_result.shape[0], topk_result.shape[1]),
+            -1,
+            dtype=topk_result.dtype,
+            device=topk_result.device,
+        )
+        topk_result = torch.cat([topk_result, padding], dim=0)
+        return topk_result
 
     def _get_topk_paged(
         self,
@@ -428,6 +750,11 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        if self._use_b12x_indexer(forward_batch):
+            return self._get_b12x_paged_topk(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -569,6 +896,11 @@ class Indexer(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
+        if self._use_b12x_indexer(forward_batch):
+            return self._get_b12x_ragged_topk(
+                forward_batch, layer_id, q_fp8, weights, metadata
+            )
+
         page_size = forward_batch.token_to_kv_pool.page_size
         if _is_hip:
             assert page_size == 1, "only support page size 1"
@@ -604,9 +936,8 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
-        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
-        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        seq_len_sum = metadata.get_indexer_seq_lens_sum()
+        max_seq_len = metadata.get_indexer_max_seq_len()
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
@@ -761,6 +1092,9 @@ class Indexer(MultiPlatformOp):
         if not return_indices:
             return None
 
+        if self._use_b12x_indexer(forward_batch):
+            return self._build_b12x_trivial_extend_topk(x_meta, metadata)
+
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
@@ -804,12 +1138,12 @@ class Indexer(MultiPlatformOp):
             forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
+        seq_lens_cpu_list = metadata.get_seq_lens_cpu_list()
         if cp_index is not None:
             # TODO Multi-batch support has accuracy issues
             for batch_idx, start_seq_position, end_seq_position in cp_index:
                 pre_chunk_offset = (
-                    forward_batch.seq_lens_cpu[batch_idx].item()
-                    - forward_batch.extend_seq_lens_cpu[batch_idx]
+                    seq_lens_cpu_list[batch_idx] - forward_batch.extend_seq_lens_cpu[batch_idx]
                 )
                 start_seq_position += pre_chunk_offset
                 end_seq_position += pre_chunk_offset
@@ -871,11 +1205,7 @@ class Indexer(MultiPlatformOp):
                 batch_idx_list=batch_idx_list,
             )
         else:
-            kv_len = (
-                forward_batch.seq_lens_cpu[0].item()
-                - forward_batch.extend_seq_lens_cpu[0]
-                + kv_len
-            )
+            kv_len = seq_lens_cpu_list[0] - forward_batch.extend_seq_lens_cpu[0] + kv_len
             k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
                 layer_id,
                 kv_len,
@@ -1126,7 +1456,7 @@ class Indexer(MultiPlatformOp):
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
-                max_kv_len = forward_batch.seq_lens_cpu.max().item()
+                max_kv_len = metadata.get_indexer_max_seq_len()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
         # Optimization: fast path when skipping topk computation

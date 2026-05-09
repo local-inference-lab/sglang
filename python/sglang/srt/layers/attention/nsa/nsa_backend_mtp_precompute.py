@@ -49,6 +49,9 @@ class PrecomputedMetadata:
     # FlashMLA (optional)
     flashmla_metadata: Optional[torch.Tensor] = None
 
+    # Paged MQA schedule metadata (optional)
+    paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
     """Compute cumulative sequence lengths with padding."""
@@ -104,6 +107,10 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         elif forward_mode.is_target_verify():
             return self._precompute_target_verify_mode(
                 bs, req_pool_indices, seq_lens, seq_lens_cpu
+            )
+        elif forward_mode.is_draft_extend_v2():
+            return self._precompute_draft_extend_v2_mode(
+                bs, req_pool_indices, seq_lens, seq_lens_cpu, spec_info
             )
         elif forward_mode.is_draft_extend():
             return self._precompute_draft_extend_mode(
@@ -303,6 +310,75 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             real_page_table = None
 
         # FlashMLA metadata
+        flashmla_metadata = None
+        if self.nsa_decode_impl == "flashmla_kv":
+            flashmla_metadata = self._compute_flashmla_metadata(
+                cache_seqlens=nsa_cache_seqlens,
+                seq_len_q=1,
+            )
+
+        return PrecomputedMetadata(
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            page_indices=page_indices,
+            real_page_table=real_page_table,
+            seqlens_expanded=seqlens_expanded,
+            nsa_cache_seqlens=nsa_cache_seqlens,
+            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            seqlens_expanded_size=seqlens_expanded_size,
+            max_len=max_seqlen_k,
+            max_seqlen_k=max_seqlen_k,
+            flashmla_metadata=flashmla_metadata,
+        )
+
+    def _precompute_draft_extend_v2_mode(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        spec_info: Optional["SpecInput"],
+    ) -> PrecomputedMetadata:
+        """Precompute metadata for draft extend v2 mode."""
+        max_seqlen_k = int(seq_lens_cpu.max().item())
+
+        cache_seqlens = seq_lens.to(torch.int32)
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
+
+        extend_seq_lens, extend_seq_lens_cpu, _ = self._resolve_draft_extend_v2_lens(
+            bs, spec_info, self.device
+        )
+
+        page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+        page_indices = torch.repeat_interleave(
+            page_indices, repeats=extend_seq_lens, dim=0
+        ).contiguous()
+
+        seqlens_expanded = torch.cat(
+            [
+                torch.arange(
+                    kv_len - qo_len + 1,
+                    kv_len + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                for qo_len, kv_len in zip(
+                    extend_seq_lens_cpu,
+                    seq_lens_cpu.tolist(),
+                    strict=True,
+                )
+            ]
+        )
+
+        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        seqlens_expanded_size = seqlens_expanded.shape[0]
+        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens)
+
+        if self.real_page_size > 1:
+            real_page_table = self._transform_table_1_to_real(page_indices)
+        else:
+            real_page_table = None
+
         flashmla_metadata = None
         if self.nsa_decode_impl == "flashmla_kv":
             flashmla_metadata = self._compute_flashmla_metadata(

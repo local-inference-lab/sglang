@@ -308,9 +308,23 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
+        supports_cuda_nsa_draft_extend_graph = False
+        if _is_cuda:
+            try:
+                from sglang.srt.layers.attention.nsa_backend import (
+                    NativeSparseAttnBackend,
+                )
+
+                supports_cuda_nsa_draft_extend_graph = isinstance(
+                    self.draft_extend_attn_backend, NativeSparseAttnBackend
+                )
+            except ImportError:
+                pass
+
         supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+            or supports_cuda_nsa_draft_extend_graph
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends

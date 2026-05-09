@@ -82,6 +82,11 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.moe_amax import (
+    finish_moe_amax_graph_capture,
+    maybe_flush_moe_amax_tracker,
+    prepare_moe_amax_for_graph_capture,
+)
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -168,6 +173,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
         seq_len_fill_value: int,
+        custom_mask_max_seq_lens_sum: Optional[int],
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
@@ -189,8 +195,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            custom_mask_seq_lens_sum = (
+                custom_mask_max_seq_lens_sum
+                if custom_mask_max_seq_lens_sum is not None
+                else max_bs * seq_len_fill_value
+            )
             custom_mask = torch.ones(
-                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                (custom_mask_seq_lens_sum + max_num_token) * num_tokens_per_bs,
                 dtype=torch.bool,
             )
             next_token_logits_buffer = torch.zeros(
@@ -689,6 +700,10 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
+        custom_mask_max_seq_lens_sum = None
+        if self.capture_forward_mode.is_target_verify():
+            max_context_len = self.model_runner.model_config.context_len
+            custom_mask_max_seq_lens_sum = self.max_bs * max_context_len
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -701,6 +716,7 @@ class CudaGraphRunner:
             is_encoder_decoder=self.is_encoder_decoder,
             require_mlp_tp_gather=self.require_mlp_tp_gather,
             seq_len_fill_value=self.seq_len_fill_value,
+            custom_mask_max_seq_lens_sum=custom_mask_max_seq_lens_sum,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
@@ -715,6 +731,7 @@ class CudaGraphRunner:
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         # Capture
+        prepare_moe_amax_for_graph_capture()
         try:
             with model_capture_mode():
                 self.capture()
@@ -722,6 +739,8 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+        finally:
+            finish_moe_amax_graph_capture()
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -808,7 +827,6 @@ class CudaGraphRunner:
             if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
-
         return (
             is_bs_supported
             and is_encoder_lens_supported
@@ -1130,6 +1148,12 @@ class CudaGraphRunner:
                 forward_batch.dp_padding_mode.is_max_len(),
             )
             set_is_extend_in_batch(False)
+            if self.model_runner.is_hybrid_swa:
+                forward_batch.out_cache_loc_swa = (
+                    self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
+                )
 
             kwargs = {}
             if (
@@ -1269,6 +1293,8 @@ class CudaGraphRunner:
                 num_token_non_padded=len(forward_batch.input_ids),
                 spec_info=forward_batch.spec_info,
             )
+        self._stage_target_verify_positions(forward_batch)
+        self._stage_target_verify_spec_inputs(forward_batch)
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
@@ -1280,17 +1306,50 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-        )
-        attn_backend._replay_forward_batch = None
+        try:
+            if hasattr(
+                attn_backend, "init_forward_metadata_replay_cuda_graph_with_cache_loc"
+            ):
+                attn_backend.init_forward_metadata_replay_cuda_graph_with_cache_loc(
+                    bs,
+                    buffers.req_pool_indices[:bs],
+                    buffers.seq_lens[:bs],
+                    forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                    buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                    self.capture_forward_mode,
+                    forward_batch.spec_info,
+                    seq_lens_cpu=(
+                        buffers.seq_lens_cpu[:bs]
+                        if attn_backend.requires_seq_lens_cpu_for_replay(
+                            self.capture_forward_mode
+                        )
+                        else None
+                    ),
+                    out_cache_loc=buffers.out_cache_loc[:bs],
+                )
+            elif attn_backend.requires_seq_lens_cpu_for_replay(self.capture_forward_mode):
+                attn_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    buffers.req_pool_indices[:bs],
+                    buffers.seq_lens[:bs],
+                    forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                    buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                    self.capture_forward_mode,
+                    forward_batch.spec_info,
+                    seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+                )
+            else:
+                attn_backend.init_forward_metadata_replay_cuda_graph_no_cpu(
+                    bs,
+                    buffers.req_pool_indices[:bs],
+                    buffers.seq_lens[:bs],
+                    forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+                    buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                    self.capture_forward_mode,
+                    forward_batch.spec_info,
+                )
+        finally:
+            attn_backend._replay_forward_batch = None
 
         # Store fields
         self.raw_bs = raw_bs
@@ -1299,6 +1358,55 @@ class CudaGraphRunner:
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
+
+    def _get_target_verify_positions(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        if (
+            not self.capture_forward_mode.is_target_verify()
+            or forward_batch.spec_info is None
+        ):
+            return None
+        return getattr(forward_batch.spec_info, "positions", None)
+
+    def _stage_target_verify_positions(self, forward_batch: ForwardBatch):
+        positions = self._get_target_verify_positions(forward_batch)
+        if positions is None:
+            return
+        if positions.numel() > self.buffers.positions.numel():
+            raise RuntimeError(
+                "Target-verify CUDA graph positions are larger than the graph "
+                f"token buffer: positions={positions.numel()}, "
+                f"buffer={self.buffers.positions.numel()}."
+            )
+        self.buffers.positions[: positions.numel()].copy_(positions)
+        forward_batch.positions = self.buffers.positions[: positions.numel()]
+
+    def _stage_target_verify_spec_inputs(self, forward_batch: ForwardBatch):
+        if (
+            not self.capture_forward_mode.is_target_verify()
+            or forward_batch.spec_info is None
+        ):
+            return
+
+        custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
+        if custom_mask is None:
+            custom_mask = getattr(forward_batch.spec_info, "tree_mask", None)
+        if custom_mask is None:
+            return
+
+        buffers = self.buffers
+        if custom_mask.numel() > buffers.custom_mask.numel():
+            raise RuntimeError(
+                "Target-verify CUDA graph custom mask is larger than the graph "
+                f"buffer: mask={custom_mask.numel()}, "
+                f"buffer={buffers.custom_mask.numel()}."
+            )
+        if custom_mask.data_ptr() != buffers.custom_mask.data_ptr():
+            buffers.custom_mask[: custom_mask.numel()].copy_(custom_mask)
+        forward_batch.spec_info.custom_mask = buffers.custom_mask
+        if hasattr(forward_batch.spec_info, "tree_mask"):
+            forward_batch.spec_info.tree_mask = buffers.custom_mask
 
     def replay(
         self,
@@ -1313,7 +1421,27 @@ class CudaGraphRunner:
         else:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            positions = self._get_target_verify_positions(forward_batch)
+            if positions is None:
+                positions = forward_batch.positions
+            if positions.numel() < self.raw_num_token:
+                raise RuntimeError(
+                    "CUDA graph replay positions are smaller than the graph "
+                    f"token count: positions={positions.numel()}, "
+                    f"tokens={self.raw_num_token}."
+                )
+            self.buffers.positions[: self.raw_num_token].copy_(
+                positions[: self.raw_num_token]
+            )
+            self.buffers.out_cache_loc[: self.raw_num_token].copy_(
+                forward_batch.out_cache_loc
+            )
+            if forward_batch.mrope_positions is not None:
+                self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
+                    forward_batch.mrope_positions
+                )
+            self._stage_target_verify_positions(forward_batch)
+            self._stage_target_verify_spec_inputs(forward_batch)
             if (
                 self.model_runner.spec_algorithm.is_dflash()
                 and self.model_runner.is_draft_worker
@@ -1338,7 +1466,7 @@ class CudaGraphRunner:
         )
         with ctx:
             self.graphs[graph_key].replay()
-
+        maybe_flush_moe_amax_tracker()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

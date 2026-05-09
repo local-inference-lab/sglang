@@ -419,6 +419,7 @@ class Envs:
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
+    SGLANG_NSA_B12X_PERSISTENT_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
@@ -750,7 +751,7 @@ def example_with_implicit_bool_avoidance():
             assert message_matcher in str(e), f"{e=}"
             print(f"assert_throws find expected error: {e}")
             return
-        raise AssertionError(f"assert_throws do not see exceptions")
+        raise AssertionError("assert_throws do not see exceptions")
 
     with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
         if envs.SGLANG_TEST_RETRACT:

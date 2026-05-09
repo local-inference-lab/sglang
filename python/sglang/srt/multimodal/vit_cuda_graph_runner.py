@@ -116,6 +116,84 @@ class ViTCudaGraphRunner:
         # x_3d: [S, B, H], B=1, S as graph_key
         return x_3d.shape[0]
 
+    def _attention_cu_ws(
+        self, cu_seqlens: torch.Tensor, seq_lens: torch.Tensor, max_len: int
+    ):
+        override_backend = get_global_server_args().mm_attention_backend
+        if override_backend == "triton_attn":
+            return [cu_seqlens, seq_lens, max_len]
+        if override_backend in ("fa3", "b12x"):
+            return [cu_seqlens, max_len]
+        raise RuntimeError(
+            f"Not supported ViT attention backend: {override_backend}"
+        )
+
+    def _warmup_once(
+        self,
+        graph_key: int,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,  # (cos, sin), [S, D]
+        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
+        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+    ) -> None:
+        if get_global_server_args().mm_attention_backend != "b12x":
+            return
+
+        vit = self.vit
+
+        if self._fullatt_block_indexes:
+            cu_window = self.cu_window_len[graph_key]
+            cu_window_kk = self.cu_window_len_kk[graph_key]
+            max_window_len = int(cu_window_kk.max().item())
+
+        cu_full = self.cu_full_len[graph_key]
+        cu_full_kk = self.cu_full_len_kk[graph_key]
+        max_full_len = int(cu_full_kk.max().item())
+
+        with torch.no_grad():
+            y = None
+            for layer_num, blk in enumerate(vit.blocks):
+                if self._fullatt_block_indexes:
+                    if layer_num in vit.fullatt_block_indexes:
+                        cu_seqlens_now = cu_full
+                        cu_seqlens_kk_now = cu_full_kk
+                        max_len = max_full_len
+                    else:
+                        cu_seqlens_now = cu_window
+                        cu_seqlens_kk_now = cu_window_kk
+                        max_len = max_window_len
+                else:
+                    cu_seqlens_now = cu_full
+                    cu_seqlens_kk_now = cu_full_kk
+                    max_len = max_full_len
+
+                cu_seq_len_ws = self._attention_cu_ws(
+                    cu_seqlens_now, cu_seqlens_kk_now, max_len
+                )
+
+                if position_embeddings is not None:
+                    y = blk(
+                        self.block_input[graph_key] if layer_num == 0 else y,
+                        cu_seqlens=cu_seq_len_ws,
+                        position_embeddings=position_embeddings,
+                        output_ws=self.block_ws[graph_key],
+                    )
+                elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+                    y = blk(
+                        self.block_input[graph_key] if layer_num == 0 else y,
+                        cu_seqlens=cu_seq_len_ws,
+                        rotary_pos_emb_cos=rotary_pos_emb_cos,
+                        rotary_pos_emb_sin=rotary_pos_emb_sin,
+                        output_ws=self.block_ws[graph_key],
+                    )
+                else:
+                    y = blk(
+                        self.block_input[graph_key] if layer_num == 0 else y,
+                        cu_seqlens=cu_seq_len_ws,
+                        output_ws=self.block_ws[graph_key],
+                    )
+
     def _create_graph(
         self,
         graph_key: int,
@@ -138,8 +216,6 @@ class ViTCudaGraphRunner:
         cu_full = self.cu_full_len[graph_key]
         cu_full_kk = self.cu_full_len_kk[graph_key]
         max_full_len = int(cu_full_kk.max().item())
-
-        override_backend = get_global_server_args().mm_attention_backend
 
         tp_group = get_tp_group()
         ca_comm = tp_group.ca_comm
@@ -165,12 +241,9 @@ class ViTCudaGraphRunner:
                     cu_seqlens_kk_now = cu_full_kk
                     max_len = max_full_len
 
-                if override_backend == "triton_attn":
-                    cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif override_backend == "fa3":
-                    cu_seq_len_ws = [cu_seqlens_now, max_len]
-                else:
-                    raise RuntimeError("Not supported ViT attention backend")
+                cu_seq_len_ws = self._attention_cu_ws(
+                    cu_seqlens_now, cu_seqlens_kk_now, max_len
+                )
 
                 if position_embeddings is not None:
                     if layer_num == 0:
@@ -267,6 +340,7 @@ class ViTCudaGraphRunner:
                 device=self.device,
                 dtype=self.dtype,
             )
+        self.block_input[graph_key].copy_(x_3d)
 
         # Qwen2.5-VL
         if self._fullatt_block_indexes:
@@ -292,6 +366,9 @@ class ViTCudaGraphRunner:
             used_cos_ws.copy_(position_embeddings[0])
             used_sin_ws.copy_(position_embeddings[1])
             persist_position_embeddings = (used_cos_ws, used_sin_ws)
+            self._warmup_once(
+                graph_key=graph_key, position_embeddings=persist_position_embeddings
+            )
             self._create_graph(
                 graph_key=graph_key, position_embeddings=persist_position_embeddings
             )
@@ -304,6 +381,12 @@ class ViTCudaGraphRunner:
             used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
             used_cos_ws.copy_(rotary_pos_emb_cos)
             used_sin_ws.copy_(rotary_pos_emb_sin)
+            self._warmup_once(
+                graph_key=graph_key,
+                position_embeddings=None,
+                rotary_pos_emb_cos=used_cos_ws,
+                rotary_pos_emb_sin=used_sin_ws,
+            )
             self._create_graph(
                 graph_key=graph_key,
                 position_embeddings=None,

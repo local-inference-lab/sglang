@@ -148,6 +148,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
+    "b12x",
     "cutlass_mla",
     "fa3",
     "fa4",
@@ -193,6 +194,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "b12x",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -222,6 +224,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cudnn",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "b12x",
 ]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
@@ -242,6 +245,7 @@ NSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
+    "b12x",
     "fa3",
     "tilelang",
     "aiter",
@@ -929,6 +933,7 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+        self._handle_b12x_moe_support()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -1660,7 +1665,14 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_nsa_backends(
+        self,
+        kv_cache_dtype: str,
+        major: int,
+        *,
+        model_arch: Optional[str] = None,
+        model_type: Optional[str] = None,
+    ) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (
             apply_hisparse_nsa_backend_defaults,
         )
@@ -1671,6 +1683,22 @@ class ServerArgs:
         if apply_hisparse_nsa_backend_defaults(
             self, user_set_prefill, user_set_decode, kv_cache_dtype
         ):
+            return
+
+        if (
+            model_type == "glm_moe_dsa"
+            and major == 12
+            and kv_cache_dtype == "fp8_e4m3"
+        ):
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "b12x"
+            if not user_set_decode:
+                self.nsa_decode_backend = "b12x"
+            logger.warning(
+                "Set NSA backends for the GLM DSA family on SM120 to b12x "
+                f"(architecture={model_arch}, prefill={self.nsa_prefill_backend}, "
+                f"decode={self.nsa_decode_backend})."
+            )
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
@@ -1717,6 +1745,8 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        model_type = getattr(hf_config, "model_type", None)
+        is_glm_dsa_family = model_type == "glm_moe_dsa"
 
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None:
@@ -1741,20 +1771,21 @@ class ServerArgs:
 
             apply_deepseek_v4_defaults(self, model_arch)
 
-        if model_arch in [
+        if is_glm_dsa_family or model_arch in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "DeepseekV3ForCausalLMNextN",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
-            "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
-                if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
+                if is_glm_dsa_family and is_blackwell_supported():
                     envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) "
+                        f"for GLM DSA family model {model_arch} on Blackwell."
                     )
                 else:
                     if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
@@ -1825,7 +1856,12 @@ class ServerArgs:
 
                     major, _ = torch.cuda.get_device_capability()
                     self._set_default_nsa_kv_cache_dtype(major, self.quantization)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_nsa_backends(
+                        self.kv_cache_dtype,
+                        major,
+                        model_arch=model_arch,
+                        model_type=getattr(hf_config, "model_type", None),
+                    )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (
@@ -3182,6 +3218,37 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_b12x_moe_support(self):
+        def validate_backend(
+            runner_backend: Optional[str],
+            a2a_backend: Optional[str],
+            *,
+            name: str,
+        ):
+            if runner_backend != "b12x":
+                return
+            effective_a2a_backend = a2a_backend or self.moe_a2a_backend
+            if effective_a2a_backend != "none" or self.ep_size > 1:
+                raise ValueError(
+                    f"b12x does not support expert-parallel MoE in sglang. "
+                    f"Unsupported {name} configuration: "
+                    f"moe_runner_backend={runner_backend!r}, "
+                    f"moe_a2a_backend={effective_a2a_backend!r}, "
+                    f"ep_size={self.ep_size}. "
+                    f"Use b12x only with --moe-a2a-backend none and --ep-size 1."
+                )
+
+        validate_backend(
+            self.moe_runner_backend,
+            self.moe_a2a_backend,
+            name="main",
+        )
+        validate_backend(
+            self.speculative_moe_runner_backend,
+            self.speculative_moe_a2a_backend,
+            name="speculative",
+        )
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:
@@ -5439,6 +5506,7 @@ class ServerArgs:
                 "sdpa",
                 "fa3",
                 "fa4",
+                "b12x",
                 "triton_attn",
                 "ascend_attn",
                 "aiter_attn",

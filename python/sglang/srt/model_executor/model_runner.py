@@ -2588,6 +2588,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
+            custom_mask_max_seq_lens_sum=None,
             encoder_len_fill_value=(
                 getattr(self.model_config.hf_config, "max_source_positions", 0)
                 if self.model_config.is_encoder_decoder

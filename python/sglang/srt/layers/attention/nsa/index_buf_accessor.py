@@ -174,6 +174,8 @@ class GetKAndS:
         seq_len_tensor: torch.Tensor,
         seq_len_sum: int,
         max_seq_len: int,
+        k_out: torch.Tensor | None = None,
+        s_out: torch.Tensor | None = None,
     ):
         """
         Triton implementation for gathering both K and S data from paged buffer in a single call.
@@ -193,6 +195,8 @@ class GetKAndS:
             max_seq_len=max_seq_len,
             page_size=pool.page_size,
             index_head_dim=pool.index_head_dim,
+            k_out=k_out,
+            s_out=s_out,
         )
 
 
@@ -617,6 +621,8 @@ def _get_k_and_s_triton(
     max_seq_len: int,
     page_size: int,
     index_head_dim: int,
+    k_out: torch.Tensor | None = None,
+    s_out: torch.Tensor | None = None,
 ):
     """
     Fused gather of both K (key) and S (scale) data from paged buffer using Triton.
@@ -633,11 +639,23 @@ def _get_k_and_s_triton(
              k_out: (seq_len, index_head_dim), uint8
              s_out: (seq_len, 4), uint8
     """
-    # Allocate outputs
-    k_out = torch.empty(
-        (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
-    )
-    s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
+    if k_out is None:
+        k_out = torch.empty(
+            (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
+        )
+    elif k_out.shape != (seq_len_sum, index_head_dim):
+        raise ValueError(
+            f"k_out must have shape {(seq_len_sum, index_head_dim)}, got {tuple(k_out.shape)}"
+        )
+    elif k_out.dtype != torch.uint8 or k_out.device != buf.device:
+        raise ValueError("k_out must be uint8 on the same device as buf")
+
+    if s_out is None:
+        s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
+    elif s_out.shape != (seq_len_sum, 4):
+        raise ValueError(f"s_out must have shape {(seq_len_sum, 4)}, got {tuple(s_out.shape)}")
+    elif s_out.dtype != torch.uint8 or s_out.device != buf.device:
+        raise ValueError("s_out must be uint8 on the same device as buf")
 
     _, buf_numel_per_page = buf.shape
     _, page_indice_batch_offset = page_indices.shape

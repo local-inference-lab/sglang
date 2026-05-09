@@ -27,6 +27,7 @@ from sglang.srt.batch_invariant_ops import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.custom_op import register_custom_op_from_extern
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -53,7 +54,13 @@ _flashinfer_layernorm_available = False
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
-            from flashinfer.norm import layernorm
+            from flashinfer.norm import layernorm as _flashinfer_layernorm
+
+            layernorm = register_custom_op_from_extern(
+                _flashinfer_layernorm,
+                op_name="flashinfer_layernorm",
+                out_shape="input",
+            )
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
