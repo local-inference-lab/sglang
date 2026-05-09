@@ -1154,8 +1154,17 @@ class ServerArgs:
         # - Otherwise, the draft model defaults to the same quantization as the target model.
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
+            self._speculative_draft_quantization_auto_inherited = True
+            self._speculative_draft_quantization_explicitly_unset = (
+                self._quantization_explicitly_unset
+            )
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+            self._speculative_draft_quantization_auto_inherited = False
+            self._speculative_draft_quantization_explicitly_unset = True
+        else:
+            self._speculative_draft_quantization_auto_inherited = False
+            self._speculative_draft_quantization_explicitly_unset = False
 
     def _handle_modelscope_paths(self):
         """Resolve model / tokenizer / speculative-draft paths from the local
@@ -1737,6 +1746,8 @@ class ServerArgs:
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
+            has_mimo_v2_quantized_mtp_layers,
+            is_mimo_v2_modelopt_fp4_checkpoint,
             is_deepseek_nsa,
         )
 
@@ -2108,8 +2119,14 @@ class ServerArgs:
                 effective_attn_tp_size = (
                     self.tp_size // attn_dp_size // self.attn_cp_size
                 )
+                # ModelOpt FP4 MiMo checkpoints load through the normal
+                # QKVParallelLinear path, not the TP-interleaved Pro path.
+                use_modelopt_fp4_qkv_loader = is_mimo_v2_modelopt_fp4_checkpoint(
+                    hf_config, self.quantization
+                )
                 if (
                     expected_attn_tp_size is not None
+                    and not use_modelopt_fp4_qkv_loader
                     and effective_attn_tp_size != expected_attn_tp_size
                 ):
                     raise ValueError(
@@ -2131,6 +2148,25 @@ class ServerArgs:
                 logger.info(
                     "Enable multi-layer EAGLE speculative decoding for MiMoV2 model."
                 )
+                if (
+                    getattr(
+                        self,
+                        "_speculative_draft_quantization_auto_inherited",
+                        False,
+                    )
+                    and is_mimo_v2_modelopt_fp4_checkpoint(
+                        hf_config, self.quantization
+                    )
+                    and not has_mimo_v2_quantized_mtp_layers(hf_config)
+                ):
+                    # Legacy ModelOpt FP4 MiMo checkpoints bundle plain BF16
+                    # MTP weights. Hybrid checkpoints with explicit MTP
+                    # quantized_layers keep the inherited ModelOpt draft config.
+                    self.speculative_draft_model_quantization = None
+                    self._speculative_draft_quantization_explicitly_unset = True
+                    logger.info(
+                        "Use unquantized MiMoV2 MTP draft weights with ModelOpt FP4 target model."
+                    )
 
             if self.enable_hierarchical_cache:
                 self.swa_full_tokens_ratio = 1.0

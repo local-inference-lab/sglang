@@ -21,7 +21,9 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
+    Tool,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
@@ -1477,6 +1479,45 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
             self.assertEqual(len(tool_calls), 1)
             self.assertEqual(tool_calls[0].function.name, "get_weather")
             self.assertEqual(fr["type"], "tool_calls")
+
+    def test_required_with_mimo_native_output_uses_mimo_parser(self):
+        """tool_choice='required' should still parse native MiMo tags if present."""
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "mimo"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+        finish_reason = {"type": "stop", "matched": None}
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                ),
+            )
+        ]
+
+        tool_calls, text, fr = chat._process_tool_calls(
+            text=(
+                "<tool_call><function=search>"
+                "<parameter=query>tetris</parameter>"
+                "</function></tool_call>"
+            ),
+            tools=tools,
+            finish_reason=finish_reason,
+            tool_choice="required",
+        )
+
+        self.assertEqual(text, "")
+        self.assertEqual(fr["type"], "tool_calls")
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(tool_calls[0].function.name, "search")
+        self.assertEqual(
+            json.loads(tool_calls[0].function.arguments), {"query": "tetris"}
+        )
 
     def test_required_without_parser_falls_back_to_json(self):
         """tool_choice='required' without parser should parse as JSON array."""

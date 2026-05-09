@@ -70,6 +70,75 @@ def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     return num_key_value_heads
 
 
+def is_mimo_v2_modelopt_fp4_checkpoint(
+    hf_config, quantization: Optional[str] = None
+) -> bool:
+    if quantization is not None and quantization.lower() in {
+        "modelopt_fp4",
+        "modelopt_mixed",
+    }:
+        return True
+
+    quant_cfg = getattr(hf_config, "quantization_config", None)
+    if quant_cfg is None:
+        return False
+    if hasattr(quant_cfg, "to_dict"):
+        quant_cfg = quant_cfg.to_dict()
+    if not isinstance(quant_cfg, dict):
+        return False
+
+    quant_method = quant_cfg.get("quant_method")
+    if isinstance(quant_method, str) and quant_method.lower() in {
+        "modelopt_fp4",
+        "modelopt_mixed",
+    }:
+        return True
+
+    nested_quant_cfg = quant_cfg.get("quantization")
+    quant_algo = quant_cfg.get("quant_algo")
+    if isinstance(nested_quant_cfg, dict):
+        nested_quant_method = nested_quant_cfg.get("quant_method")
+        if (
+            isinstance(nested_quant_method, str)
+            and nested_quant_method.lower() in {"modelopt_fp4", "modelopt_mixed"}
+        ):
+            return True
+        quant_algo = quant_algo or nested_quant_cfg.get("quant_algo")
+
+    if isinstance(quant_algo, str):
+        quant_algo = quant_algo.upper()
+        return (
+            "FP4" in quant_algo
+            or "NVFP4" in quant_algo
+            or quant_algo == "MIXED_PRECISION"
+        )
+    return False
+
+
+def has_mimo_v2_quantized_mtp_layers(hf_config) -> bool:
+    quant_cfg = getattr(hf_config, "quantization_config", None)
+    if quant_cfg is None:
+        return False
+    if hasattr(quant_cfg, "to_dict"):
+        quant_cfg = quant_cfg.to_dict()
+    if not isinstance(quant_cfg, dict):
+        return False
+
+    quantized_layers = quant_cfg.get("quantized_layers")
+    nested_quant_cfg = quant_cfg.get("quantization")
+    if not isinstance(quantized_layers, dict) and isinstance(nested_quant_cfg, dict):
+        quantized_layers = nested_quant_cfg.get("quantized_layers")
+    if not isinstance(quantized_layers, dict):
+        return False
+
+    return any(
+        isinstance(layer_info, dict)
+        and bool(str(layer_info.get("quant_algo", "")).strip())
+        and name.startswith("model.mtp.layers.")
+        for name, layer_info in quantized_layers.items()
+    )
+
+
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
@@ -165,6 +234,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        quantization_explicitly_unset: bool = False,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
@@ -179,6 +249,7 @@ class ModelConfig:
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.quantization_explicitly_unset = quantization_explicitly_unset
         self.is_draft_model = is_draft_model
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -379,6 +450,15 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        quantization_explicitly_unset = (
+            getattr(
+                server_args,
+                "_speculative_draft_quantization_explicitly_unset",
+                False,
+            )
+            if is_draft_model
+            else getattr(server_args, "_quantization_explicitly_unset", False)
+        )
         override_config_file = (
             server_args.decrypted_draft_config_file
             if is_draft_model
@@ -394,6 +474,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=quantization,
+            quantization_explicitly_unset=quantization_explicitly_unset,
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
@@ -881,7 +962,7 @@ class ModelConfig:
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
-        if quant_cfg is not None:
+        if quant_cfg is not None and not self.quantization_explicitly_unset:
             # Identify modelopt quantization
             if (
                 "quant_method" not in quant_cfg
@@ -1186,7 +1267,7 @@ class ModelConfig:
             )
         quant_cfg = cfg_list[0] if cfg_list else None
 
-        if quant_cfg is not None:
+        if quant_cfg is not None and not self.quantization_explicitly_unset:
             quant_method = quant_cfg.get(
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()

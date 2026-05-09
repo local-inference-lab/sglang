@@ -1269,12 +1269,25 @@ class OpenAIServingResponses(OpenAIServingChat):
         orig_priority = priority or 0
 
         while True:
+            stream_offset = 0
+
             # Generate using SGLang's tokenizer manager
             generator = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             )
 
             async for res in generator:
+                raw_text = res.get("text") if isinstance(res, dict) else None
+                if adapted_request.stream and raw_text is not None:
+                    if self.tokenizer_manager.server_args.incremental_streaming_output:
+                        raw_delta = raw_text
+                    else:
+                        raw_delta = raw_text[stream_offset:]
+                    stream_offset = len(raw_text)
+                else:
+                    raw_delta = raw_text
+
+                self._print_raw_model_output(raw_delta)
                 context.append_output(res)
                 # NOTE(woosuk): The stop condition is handled by the engine.
                 yield context

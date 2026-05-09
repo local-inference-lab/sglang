@@ -43,6 +43,7 @@ class BaseReasoningFormatDetector:
         self.reasoning_default = reasoning_default
 
         self._buffer = ""
+        self._reasoning_accumulator = ""
         self.stripped_think_start = False
         self.think_start_self_label = ""
 
@@ -69,44 +70,102 @@ class BaseReasoningFormatDetector:
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
 
-        # The text is considered to be in a reasoning block.
-        processed_text = text.replace(
-            self.think_start_token + self.think_start_self_label, ""
-        ).strip()
+        think_start_text = self.think_start_token + self.think_start_self_label
+        end_idx = text.find(self.think_end_token)
+        tool_idx = (
+            text.find(self.tool_start_token)
+            if self.tool_start_token is not None
+            else -1
+        )
 
-        if (
-            self.think_end_token not in processed_text
-            and self.think_end_token not in self.previous_content
-        ):
-            # Check for tool_start_token interruption
-            if (
-                in_reasoning
-                and self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
-                # Find the first occurrence of tool_start_token and split there
-                tool_idx = processed_text.find(self.tool_start_token)
-                reasoning_text = processed_text[:tool_idx].strip()
-                # Preserve tool_start_token in normal text
-                normal_text = processed_text[tool_idx:]
-                return StreamingParseResult(
-                    normal_text=normal_text, reasoning_text=reasoning_text
-                )
+        if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
+            # Treat tool-call markup as ending reasoning when it appears before
+            # the explicit reasoning end token.
+            reasoning_text = text[:tool_idx].replace(think_start_text, "").strip()
+            normal_text = text[tool_idx:]
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text
+            )
+
+        if end_idx == -1 and self.think_end_token not in self.previous_content:
             # Assume reasoning was truncated before end token
-            return StreamingParseResult(reasoning_text=processed_text)
+            return StreamingParseResult(
+                reasoning_text=text.replace(think_start_text, "").strip()
+            )
 
         # Extract reasoning content
-        if self.think_end_token in processed_text:
-            splits = processed_text.split(self.think_end_token, maxsplit=1)
-            reasoning_text = splits[0]
-            normal_text = splits[1].strip()
+        if end_idx != -1:
+            reasoning_text = text[:end_idx].replace(think_start_text, "").strip()
+            normal_text = text[end_idx + len(self.think_end_token) :].strip()
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
-            return StreamingParseResult(normal_text=processed_text)
+            return StreamingParseResult(
+                normal_text=text.replace(think_start_text, "").strip()
+            )
+
+    @staticmethod
+    def _find_first_marker(text: str, markers: list[str]) -> tuple[int, str] | None:
+        """Return the earliest full marker occurrence in text."""
+        first_idx = -1
+        first_marker = ""
+        for marker in markers:
+            if not marker:
+                continue
+            idx = text.find(marker)
+            if idx == -1:
+                continue
+            if first_idx == -1 or idx < first_idx:
+                first_idx = idx
+                first_marker = marker
+        if first_idx == -1:
+            return None
+        return first_idx, first_marker
+
+    @staticmethod
+    def _partial_suffix_len(text: str, markers: list[str]) -> int:
+        """Return the longest suffix that could become one of the markers."""
+        max_suffix_len = 0
+        for marker in markers:
+            if not marker:
+                continue
+            max_len = min(len(text), len(marker) - 1)
+            for suffix_len in range(1, max_len + 1):
+                if text.endswith(marker[:suffix_len]):
+                    max_suffix_len = max(max_suffix_len, suffix_len)
+        return max_suffix_len
+
+    def _reasoning_markers(self) -> list[str]:
+        markers = [
+            self.think_end_token,
+            self.think_start_token + self.think_start_self_label,
+        ]
+        if self.tool_start_token:
+            markers.append(self.tool_start_token)
+        return markers
+
+    def _normal_markers(self) -> list[str]:
+        markers = [self.think_end_token]
+        if not self.stripped_think_start:
+            markers.append(self.think_start_token + self.think_start_self_label)
+        return markers
+
+    def _append_reasoning(self, text: str, reasoning_parts: list[str]) -> None:
+        if not text:
+            return
+        if self.stream_reasoning:
+            reasoning_parts.append(text)
+        else:
+            self._reasoning_accumulator += text
+
+    def _flush_reasoning_accumulator(self, reasoning_parts: list[str]) -> None:
+        if self.stream_reasoning or not self._reasoning_accumulator:
+            return
+        reasoning_parts.append(self._reasoning_accumulator)
+        self._reasoning_accumulator = ""
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -119,66 +178,67 @@ class BaseReasoningFormatDetector:
             Streams reasoning content as it arrives
         """
         self._buffer += new_text
-        current_text = self._buffer
-
+        normal_parts: list[str] = []
+        reasoning_parts: list[str] = []
         think_start_text = self.think_start_token + self.think_start_self_label
 
-        # If the current text is a prefix of the think token, keep buffering
-        tokens_to_check = [think_start_text, self.think_end_token]
-        if self.tool_start_token:
-            tokens_to_check.append(self.tool_start_token)
-        if any(
-            token.startswith(current_text) and token != current_text
-            for token in tokens_to_check
-        ):
-            return StreamingParseResult()
+        while self._buffer:
+            if self._in_reasoning:
+                markers = self._reasoning_markers()
+                marker_match = self._find_first_marker(self._buffer, markers)
+                if marker_match is None:
+                    suffix_len = self._partial_suffix_len(self._buffer, markers)
+                    safe_len = len(self._buffer) - suffix_len
+                    self._append_reasoning(self._buffer[:safe_len], reasoning_parts)
+                    self._buffer = self._buffer[safe_len:]
+                    break
 
-        # Strip `<think>` token if present
-        if not self.stripped_think_start and think_start_text in current_text:
-            current_text = current_text.replace(think_start_text, "", 1)
-            self.stripped_think_start = True
-            self._in_reasoning = True
+                marker_idx, marker = marker_match
+                self._append_reasoning(self._buffer[:marker_idx], reasoning_parts)
 
-        # Handle end of reasoning block
-        if self._in_reasoning and self.think_end_token in current_text:
-            end_idx = current_text.find(self.think_end_token)
+                if marker == think_start_text:
+                    self.stripped_think_start = True
+                    self._buffer = self._buffer[marker_idx + len(marker) :]
+                    continue
 
-            reasoning_text = current_text[:end_idx]
+                if marker == self.think_end_token:
+                    self._buffer = self._buffer[marker_idx + len(marker) :]
+                    self._in_reasoning = False
+                    self._flush_reasoning_accumulator(reasoning_parts)
+                    continue
 
-            self._buffer = ""
-            self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
-
-            return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
-            )
-
-        # Continue with reasoning content
-        if self._in_reasoning:
-            # Check for tool_start_token interruption
-            if self.tool_start_token and self.tool_start_token in current_text:
-                tool_idx = current_text.find(self.tool_start_token)
-                reasoning_text = current_text[:tool_idx]
-                # Preserve tool_start_token in normal text
-                normal_text = current_text[tool_idx:]
+                # Tool-call markers switch the remainder of the current chunk to
+                # normal text so the function-call parser receives the raw marker.
+                normal_parts.append(self._buffer[marker_idx:])
                 self._buffer = ""
                 self._in_reasoning = False
-                return StreamingParseResult(
-                    normal_text=normal_text, reasoning_text=reasoning_text
-                )
-            if self.stream_reasoning:
-                # Stream the content immediately
-                self._buffer = ""
-                return StreamingParseResult(reasoning_text=current_text)
-            else:
-                return StreamingParseResult()
+                self._flush_reasoning_accumulator(reasoning_parts)
+                break
 
-        # If we're not in a reasoning block return as normal text
-        if not self._in_reasoning:
-            self._buffer = ""
-            return StreamingParseResult(normal_text=current_text)
+            markers = self._normal_markers()
+            marker_match = (
+                self._find_first_marker(self._buffer, [think_start_text])
+                if not self.stripped_think_start
+                else None
+            )
+            if marker_match is not None:
+                marker_idx, marker = marker_match
+                normal_parts.append(self._buffer[:marker_idx])
+                self.stripped_think_start = True
+                self._in_reasoning = True
+                self._buffer = self._buffer[marker_idx + len(marker) :]
+                continue
 
-        return StreamingParseResult()
+            suffix_len = self._partial_suffix_len(self._buffer, markers)
+            safe_len = len(self._buffer) - suffix_len
+            normal_parts.append(self._buffer[:safe_len])
+            self._buffer = self._buffer[safe_len:]
+            break
+
+        return StreamingParseResult(
+            normal_text="".join(normal_parts),
+            reasoning_text="".join(reasoning_parts),
+        )
 
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
@@ -331,6 +391,42 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
+class MiMoReasoningDetector(BaseReasoningFormatDetector):
+    """
+    Detector for MiMo reasoning with native `<tool_call>` interruption.
+
+    MiMo can switch from reasoning to its native tool-call grammar before it
+    emits `</think>`, so the reasoning parser must pass `<tool_call>` through
+    as normal text for the function-call parser.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        think_excluded_tokens = [
+            "<tool_call>",
+            "</tool_call>",
+            "<|im_end|>",
+            "<|endoftext|>",
+        ]
+        super().__init__(
+            "<think>",
+            "</think>",
+            think_excluded_tokens=think_excluded_tokens,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="explicit_enable_thinking",
+        )
+
+
 class Glm45Detector(BaseReasoningFormatDetector):
     """
     Detector for GLM-4.5 models.
@@ -344,7 +440,13 @@ class Glm45Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         think_excluded_tokens = [
             "<tool_call>",
             "</tool_call>",
@@ -359,6 +461,8 @@ class Glm45Detector(BaseReasoningFormatDetector):
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
             thinks_internally=True,
             reasoning_default="enable_thinking",
         )
@@ -616,8 +720,8 @@ class ReasoningParser:
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
-        "mimo": _MimoDetector,
         "poolside_v1": _PoolsideV1Detector,
+        "mimo": MiMoReasoningDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,

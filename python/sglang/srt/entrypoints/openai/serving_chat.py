@@ -237,6 +237,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or None.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
+    def _print_raw_model_output(
+        self,
+        text: Optional[str],
+    ) -> None:
+        if text is None or not envs.SGLANG_PRINT_RAW_MODEL_OUTPUT.get():
+            return
+
+        print(text, end="", flush=True)
+
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -918,6 +927,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     delta = content["text"][offset:]
                 stream_offsets[index] = len(content["text"])
 
+                self._print_raw_model_output(delta)
+
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
@@ -1145,6 +1156,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
+            self._print_raw_model_output(text)
 
             # Handle reasoning content
             reasoning_text = None
@@ -1306,15 +1318,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
 
-        # Try model-specific parser when output is in native format.
-        # For required/named: only use parser when structural_tag was used
-        # as constraint (mirrors the streaming path). For auto: always try.
+        # Try the model-specific parser whenever the output actually contains
+        # the model's native tool-call marker. Required/named requests normally
+        # use JSON-schema constrained output for parsers without structural-tag
+        # support, but models can still emit native tags; parse those instead
+        # of incorrectly falling through to JSON.
         if self.tool_call_parser:
             parser = FunctionCallParser(tools, self.tool_call_parser)
-            should_try_parser = (
-                not is_required or parser.detector.supports_structural_tag()
-            )
-            if should_try_parser and parser.has_tool_call(text):
+            if parser.has_tool_call(text):
                 original_finish_type = finish_reason["type"]
                 if finish_reason["type"] == "stop":
                     finish_reason["type"] = "tool_calls"
@@ -1545,11 +1556,10 @@ class OpenAIServingChat(OpenAIServingBase):
             is_required = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
             )
-            # For required/named tool choice: use JsonArrayParser when the
-            # constrained output is plain JSON (detector doesn't support
-            # structural_tag or no parser configured). Use FunctionCallParser
-            # only when the detector supports structural_tag and will produce
-            # native format output.
+            # For required/named tool choice: JSON-schema constraints usually
+            # produce plain JSON when the detector has no structural-tag support.
+            # If the stream clearly starts the native format anyway, switch to
+            # the model parser so native tags do not leak as content.
             if is_required:
                 use_native_parser = False
                 if self.tool_call_parser:
@@ -1557,7 +1567,15 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
                     )
-                    use_native_parser = probe.detector.supports_structural_tag()
+                    use_native_parser = (
+                        probe.detector.supports_structural_tag()
+                        or probe.detector.has_tool_call(delta)
+                        or bool(
+                            probe.detector._ends_with_partial_token(
+                                delta, probe.detector.bot_token
+                            )
+                        )
+                    )
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:

@@ -10,6 +10,7 @@ from sglang.srt.parser.reasoning_parser import (
     HunyuanDetector,
     KimiDetector,
     KimiK2Detector,
+    MiMoReasoningDetector,
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
@@ -155,6 +156,59 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         )
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "normal")
+
+    def test_parse_streaming_increment_start_token_suffix_split(self):
+        """A partial start token at the end of normal text should be held."""
+        result1 = self.detector.parse_streaming_increment("prefix <thi")
+        self.assertEqual(result1.normal_text, "prefix ")
+        self.assertEqual(result1.reasoning_text, "")
+
+        result2 = self.detector.parse_streaming_increment("nk>reasoning")
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(result2.reasoning_text, "reasoning")
+        self.assertTrue(self.detector._in_reasoning)
+
+    def test_parse_streaming_increment_end_token_suffix_split(self):
+        """A partial end token at the end of reasoning should be held."""
+        self.detector.parse_streaming_increment("<think>")
+
+        result1 = self.detector.parse_streaming_increment("reasoning </thi")
+        self.assertEqual(result1.normal_text, "")
+        self.assertEqual(result1.reasoning_text, "reasoning ")
+
+        result2 = self.detector.parse_streaming_increment("nk>normal")
+        self.assertEqual(result2.normal_text, "normal")
+        self.assertEqual(result2.reasoning_text, "")
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_every_split_point_in_complete_reasoning_block(self):
+        """Every possible two-chunk split should preserve reasoning tags."""
+        full_text = "<think>reasoning</think>normal"
+        for split_at in range(1, len(full_text)):
+            with self.subTest(split_at=split_at):
+                detector = BaseReasoningFormatDetector("<think>", "</think>")
+                all_reasoning = ""
+                all_normal = ""
+                for chunk in [full_text[:split_at], full_text[split_at:]]:
+                    result = detector.parse_streaming_increment(chunk)
+                    all_reasoning += result.reasoning_text
+                    all_normal += result.normal_text
+
+                self.assertEqual(all_reasoning, "reasoning")
+                self.assertEqual(all_normal, "normal")
+
+    def test_single_character_chunks_in_complete_reasoning_block(self):
+        """Single-character chunks should not leak any reasoning tag fragments."""
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in "<think>reasoning</think>normal":
+            result = detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            all_normal += result.normal_text
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "normal")
 
 
 class TestDeepSeekR1Detector(CustomTestCase):
@@ -365,6 +419,144 @@ class TestKimiK2Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "<|tool_call_begin|>")
 
 
+class TestMiMoReasoningDetector(CustomTestCase):
+    """Test cases for MiMo reasoning with native tool-call interruption."""
+
+    def setUp(self):
+        self.detector = MiMoReasoningDetector()
+
+    def test_init(self):
+        """Test MiMoReasoningDetector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertEqual(self.detector.tool_start_token, "<tool_call>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+
+    def test_detect_and_parse_tool_interrupt(self):
+        """Test parsing with native MiMo tool-call interruption."""
+        text = "<think>thinking<tool_call>\n<function=search>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(result.normal_text, "<tool_call>\n<function=search>")
+
+    def test_detect_and_parse_tool_interrupt_before_end_token(self):
+        """A MiMo tool-call marker ends reasoning even if </think> appears later."""
+        text = (
+            "<think>thinking<tool_call>\n"
+            "<function=search></function></tool_call></think>final"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(
+            result.normal_text,
+            "<tool_call>\n<function=search></function></tool_call></think>final",
+        )
+
+    def test_detect_and_parse_nested_think_is_noop_in_reasoning(self):
+        """A second <think> inside reasoning is redundant markup, not content."""
+        text = "<think>outer <think>inner</think>final"
+        result = self.detector.detect_and_parse(text)
+
+        self.assertEqual(result.reasoning_text, "outer inner")
+        self.assertEqual(result.normal_text, "final")
+
+    def test_detect_and_parse_preserves_think_inside_tool_call(self):
+        """After <tool_call>, reasoning parsing must not rewrite tool payloads."""
+        text = (
+            "<think>thinking"
+            "<tool_call><function=search>"
+            "<parameter=query><think>literal</parameter>"
+        )
+        result = self.detector.detect_and_parse(text)
+
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(
+            result.normal_text,
+            "<tool_call><function=search><parameter=query><think>literal</parameter>",
+        )
+
+    def test_streaming_tool_interrupt_split_tokens(self):
+        """Test MiMo tool-call marker split across streaming chunks."""
+        parser = ReasoningParser("mimo")
+        self.assertIsInstance(parser.detector, MiMoReasoningDetector)
+
+        chunks = ["<think>", "reasoning", "<tool_", "call>\n<function=search>"]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "<tool_call>\n<function=search>")
+
+    def test_streaming_nested_think_is_noop_in_reasoning(self):
+        """Split nested <think> markers should not leak into reasoning_content."""
+        parser = ReasoningParser("mimo")
+        all_reasoning = ""
+        all_normal = ""
+        chunks = ["<think>outer <", "think>inner", "</think>final"]
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "outer inner")
+        self.assertEqual(all_normal, "final")
+
+    def test_streaming_preserves_think_inside_tool_call(self):
+        """Once tool-call markup starts, <think> belongs to the tool payload."""
+        parser = ReasoningParser("mimo")
+        all_reasoning = ""
+        all_normal = ""
+        chunks = [
+            "<think>thinking<tool_",
+            "call><function=search>",
+            "<parameter=query><think>literal</parameter>",
+        ]
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "thinking")
+        self.assertEqual(
+            all_normal,
+            "<tool_call><function=search><parameter=query><think>literal</parameter>",
+        )
+
+    def test_every_split_point_tool_call_ends_reasoning(self):
+        """A split MiMo tool-call marker should always end the thinking block."""
+        full_text = "<think>reasoning<tool_call>\n<function=search>"
+        for split_at in range(1, len(full_text)):
+            with self.subTest(split_at=split_at):
+                parser = ReasoningParser("mimo")
+                all_reasoning = ""
+                all_normal = ""
+                for chunk in [full_text[:split_at], full_text[split_at:]]:
+                    reasoning, normal = parser.parse_stream_chunk(chunk)
+                    all_reasoning += reasoning
+                    all_normal += normal
+
+                self.assertEqual(all_reasoning, "reasoning")
+                self.assertEqual(all_normal, "<tool_call>\n<function=search>")
+
+    def test_single_character_tool_call_ends_reasoning(self):
+        """MiMo reasoning should survive a one-character-at-a-time tool marker."""
+        parser = ReasoningParser("mimo")
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in "<think>reasoning<tool_call>\n<function=search>":
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            all_reasoning += reasoning
+            all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, "<tool_call>\n<function=search>")
+
+
 class TestGlm45Detector(CustomTestCase):
     """Test cases for GLM45 detector with tool interruption support."""
 
@@ -397,6 +589,13 @@ class TestGlm45Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "I need to think")
         self.assertEqual(result.normal_text, "<tool_call>tool call data")
+
+    def test_detect_and_parse_tool_interrupt_before_end_token(self):
+        """A tool-call marker before </think> should end reasoning."""
+        text = "<think>thinking<tool_call>tool call</think>answer"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(result.normal_text, "<tool_call>tool call</think>answer")
 
     def test_detect_and_parse_multiple_tool_calls_find(self):
         """
@@ -464,16 +663,21 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result1.reasoning_text, "thinking")
 
         # Send partial tool token (should be buffered, not emitted)
-        result2 = self.detector.parse_streaming_increment("<tool_call>")
-        # Tool token is in buffer, causing switch to normal mode
+        result2 = self.detector.parse_streaming_increment("<tool")
         self.assertEqual(result2.reasoning_text, "")
-        self.assertEqual(result2.normal_text, "<tool_call>")
+        self.assertEqual(result2.normal_text, "")
+        self.assertTrue(self.detector._in_reasoning)
+
+        # Complete the tool token; the parser switches to normal mode.
+        result3 = self.detector.parse_streaming_increment("_call>")
+        self.assertEqual(result3.reasoning_text, "")
+        self.assertEqual(result3.normal_text, "<tool_call>")
         self.assertFalse(self.detector._in_reasoning)
 
         # Send tool args
-        result3 = self.detector.parse_streaming_increment("tool args")
-        self.assertEqual(result3.reasoning_text, "")
-        self.assertEqual(result3.normal_text, "tool args")
+        result4 = self.detector.parse_streaming_increment("tool args")
+        self.assertEqual(result4.reasoning_text, "")
+        self.assertEqual(result4.normal_text, "tool args")
 
     def test_streaming_no_stream_reasoning(self):
         """Test streaming without stream_reasoning enabled."""
@@ -487,18 +691,14 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work - flushes buffered reasoning.
-        # Note: when stream_reasoning=False, the <think> tag is stripped from the
-        # local `current_text` variable but NOT from `self._buffer` (which is never
-        # cleared in the non-streaming path). So the flushed reasoning content
-        # includes the raw <think> tag.
+        # Tool interruption should still work and flush buffered reasoning.
         result = detector.parse_streaming_increment("<tool_call>tool call")
-        self.assertEqual(result.reasoning_text, "<think>thinking")
+        self.assertEqual(result.reasoning_text, "thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
     def test_streaming_empty_reasoning_with_tool(self):
         """Test empty reasoning block followed by tool call."""
-        result1 = self.detector.parse_streaming_increment("<think>")
+        self.detector.parse_streaming_increment("<think>")
         result2 = self.detector.parse_streaming_increment("<tool_call>tool call")
         self.assertEqual(result2.reasoning_text, "")
         self.assertEqual(result2.normal_text, "<tool_call>tool call")
@@ -778,7 +978,7 @@ class TestGemma4Detector(CustomTestCase):
         self.assertEqual(result1.reasoning_text, "")
         self.assertEqual(result1.normal_text, "")
 
-        result2 = self.detector.parse_streaming_increment("thought\n")
+        self.detector.parse_streaming_increment("thought\n")
         self.assertTrue(self.detector._in_reasoning)
 
         result3 = self.detector.parse_streaming_increment("reasoning here")
@@ -836,6 +1036,9 @@ class TestReasoningParser(CustomTestCase):
 
         parser = ReasoningParser("hunyuan")
         self.assertIsInstance(parser.detector, HunyuanDetector)
+
+        parser = ReasoningParser("mimo")
+        self.assertIsInstance(parser.detector, MiMoReasoningDetector)
 
         parser = ReasoningParser("gemma4")
         self.assertIsInstance(parser.detector, Gemma4Detector)

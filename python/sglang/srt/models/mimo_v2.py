@@ -20,7 +20,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.configs.model_config import (
+    get_mimo_v2_fused_qkv_expected_tp_size,
+    is_mimo_v2_modelopt_fp4_checkpoint,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -55,7 +58,12 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+    select_experts,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -69,6 +77,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -83,6 +92,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     make_layers,
 )
+from sglang.srt.utils.moe_amax import get_moe_amax_tracker
 
 MiMoV2Config = None
 
@@ -90,8 +100,29 @@ logger = logging.getLogger(__name__)
 
 
 def load_mimo_v2_qkv_proj_weight(
-    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+    name,
+    param,
+    loaded_weight,
+    expected_fused_tp_size: Optional[int] = None,
+    use_qkv_parallel_loader: bool = False,
 ):
+    if use_qkv_parallel_loader:
+        # ModelOpt FP4 checkpoints use the normal QKVParallelLinear loaders,
+        # which already split fused qkv tensors and support arbitrary TP sizes.
+        if loaded_weight.shape == param.shape:
+            default_weight_loader(param, loaded_weight)
+            return
+        if (
+            loaded_weight.numel() == 1
+            and param.data.ndim == 1
+            and param.data.numel() > 1
+        ):
+            param.data.fill_(loaded_weight.item())
+            return
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, loaded_weight)
+        return
+
     if loaded_weight.shape == param.shape:
         # The checkpoint already stores this rank's qkv_proj shard.
         default_weight_loader(param, loaded_weight)
@@ -270,6 +301,7 @@ class MiMoV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
+            scoring_func=getattr(config, "scoring_func", "softmax"),
             routed_scaling_factor=1.0,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
@@ -296,6 +328,36 @@ class MiMoV2MoE(nn.Module):
 
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        )
+        self.moe_amax_tracker = get_moe_amax_tracker()
+        self.moe_amax_prefix = prefix or f"model.layers.{layer_id}.mlp"
+
+    def _track_moe_amax(
+        self, hidden_states: torch.Tensor, topk_output: TopKOutput
+    ) -> None:
+        if self.moe_amax_tracker is None:
+            return
+
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        if topk_ids is None and hasattr(topk_output, "router_logits"):
+            topk_ids = select_experts(
+                hidden_states=hidden_states,
+                layer_id=self.layer_id,
+                router_logits=topk_output.router_logits,
+                topk_config=getattr(topk_output, "topk_config", self.topk.topk_config),
+                num_token_non_padded=getattr(
+                    topk_output, "num_token_non_padded", None
+                ),
+                expert_location_dispatch_info=getattr(
+                    topk_output, "expert_location_dispatch_info", None
+                ),
+            ).topk_ids
+        self.moe_amax_tracker.update_moe_inputs(
+            module_prefix=self.moe_amax_prefix,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            num_routed_experts=self.config.n_routed_experts,
+            suppress_host_update=get_is_capture_mode(),
         )
 
     def get_moe_weights(self):
@@ -335,6 +397,7 @@ class MiMoV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
+        self._track_moe_amax(hidden_states, topk_output)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
@@ -453,6 +516,7 @@ class MiMoV2Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
+        disable_o_proj_quant: bool = False,
         partial_rotary_factor: float = 1.0,
         prefix: str = "",
     ) -> None:
@@ -504,7 +568,7 @@ class MiMoV2Attention(nn.Module):
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=None if disable_o_proj_quant else quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             reduce_results=False,
@@ -1124,13 +1188,14 @@ class MiMoV2ForCausalLM(nn.Module):
             )
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            logits_output = self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
                 hidden_states_before_norm=hidden_states_before_norm,
             )
+            return logits_output
         else:
             return hidden_states
 
@@ -1167,6 +1232,10 @@ class MiMoV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
+        use_modelopt_fp4_qkv_loader = is_mimo_v2_modelopt_fp4_checkpoint(
+            self.config,
+            self.quant_config.get_name() if self.quant_config is not None else None,
+        )
 
         for name, loaded_weight in weights:
             if not self._is_multimodal and (
@@ -1312,7 +1381,11 @@ class MiMoV2ForCausalLM(nn.Module):
                         self.config
                     )
                     load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size,
+                        use_qkv_parallel_loader=use_modelopt_fp4_qkv_loader,
                     )
                 continue
 
@@ -1323,12 +1396,13 @@ class MiMoV2ForCausalLM(nn.Module):
                     or "compressed_softmax_attn" in name
                 ):
                     continue
-                if weight_name not in name:
+                weight_pattern = f".{weight_name}."
+                if weight_pattern not in name:
                     continue
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
 
-                name = name.replace(weight_name, param_name)
+                name = name.replace(weight_pattern, f".{param_name}.")
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue

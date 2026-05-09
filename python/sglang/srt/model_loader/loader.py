@@ -335,6 +335,9 @@ class DefaultModelLoader(BaseModelLoader):
         "Glm4MoeForCausalLMNextN",
         "GlmOcrForConditionalGenerationNextN",
     }
+    _MTP_SHARED_LM_HEAD_ARCHITECTURES = {
+        "MiMoV2MTP",
+    }
 
     @dataclasses.dataclass
     class Source:
@@ -667,7 +670,10 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.load_config.draft_model_idx is not None:
             return self._filter_mtp_weights(
-                weights_iterator, source.prefix, self.load_config.draft_model_idx
+                weights_iterator,
+                source.prefix,
+                self.load_config.draft_model_idx,
+                skip_lm_head_weight=self._should_skip_mtp_lm_head_weight(source),
             )
 
         if self.counter_before_loading_weights == 0.0:
@@ -677,12 +683,21 @@ class DefaultModelLoader(BaseModelLoader):
 
     @classmethod
     def _filter_mtp_weights(
-        cls, weights_iterator, prefix: str, draft_model_idx: int
+        cls,
+        weights_iterator,
+        prefix: str,
+        draft_model_idx: int,
+        *,
+        skip_lm_head_weight: bool = False,
     ) -> Tuple[Tuple[str, torch.Tensor], ...]:
         """Filter MTP (Multi-Token Prediction) weights to keep only the
         specified draft model layer and remap it to layer 0."""
         filtered_weights = []
         for name, tensor in weights_iterator:
+            if skip_lm_head_weight and (
+                name == "lm_head.weight" or name.endswith(".lm_head.weight")
+            ):
+                continue
             match = cls._MTP_PATTERN.match(name)
             if match is not None:
                 idx = int(match.group(1))
@@ -693,6 +708,16 @@ class DefaultModelLoader(BaseModelLoader):
                 new_name = name
             filtered_weights.append((prefix + new_name, tensor))
         return tuple(filtered_weights)
+
+    def _should_skip_mtp_lm_head_weight(self, source: "Source") -> bool:
+        draft_model_idx = self.load_config.draft_model_idx
+        if draft_model_idx is None:
+            return False
+        if source.model_config is None:
+            return False
+
+        archs = getattr(source.model_config.hf_config, "architectures", None) or []
+        return any(arch in self._MTP_SHARED_LM_HEAD_ARCHITECTURES for arch in archs)
 
     def _get_all_weights(
         self,

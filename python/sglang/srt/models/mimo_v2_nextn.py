@@ -19,7 +19,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
@@ -29,6 +28,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
+    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -44,7 +44,6 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
-    load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -52,6 +51,11 @@ from sglang.srt.utils import add_prefix
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+
+class _DeferredSharedLMHead(nn.Module):
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("deferred shared lm_head was used before being attached")
 
 
 class MiMoV2MTPLayer(nn.Module):
@@ -94,6 +98,7 @@ class MiMoV2MTPLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            disable_o_proj_quant=True,
             partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
             prefix=add_prefix("self_attn", prefix),
         )
@@ -167,6 +172,7 @@ class MiMoV2ModelNextN(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -189,7 +195,7 @@ class MiMoV2ModelNextN(nn.Module):
             config,
             0,
             quant_config=quant_config,
-            prefix=add_prefix("decoder", prefix),
+            prefix=add_prefix(f"mtp.layers.{draft_model_idx or 0}", prefix),
         )
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
 
@@ -205,14 +211,10 @@ class MiMoV2ModelNextN(nn.Module):
         else:
             hidden_states = input_embeds
         if hidden_states.shape[0] > 0:
+            token_norm = self.enorm(hidden_states)
+            hidden_norm = self.hnorm(forward_batch.spec_info.hidden_states)
             hidden_states = self.eh_proj(
-                torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(forward_batch.spec_info.hidden_states),
-                    ),
-                    dim=-1,
-                )
+                torch.cat((token_norm, hidden_norm), dim=-1)
             )
         hidden_states, residual = self.mtp_block(
             positions=positions,
@@ -220,12 +222,11 @@ class MiMoV2ModelNextN(nn.Module):
             forward_batch=forward_batch,
             residual=None,
         )
+        before_final_norm = hidden_states if residual is None else hidden_states + residual
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
             if forward_batch.return_hidden_states_before_norm:
-                hidden_states_before_norm = (
-                    hidden_states if residual is None else hidden_states + residual
-                )
+                hidden_states_before_norm = before_final_norm
             if residual is not None:
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)
             else:
@@ -247,17 +248,25 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.draft_model_idx = draft_model_idx or 0
+        self.defer_shared_lm_head = draft_model_idx is not None
 
         self.model = MiMoV2ModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            draft_model_idx=self.draft_model_idx,
+            prefix=add_prefix("model", prefix),
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if self.defer_shared_lm_head:
+            self.lm_head = _DeferredSharedLMHead()
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -270,13 +279,14 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         hidden_states, hidden_states_before_norm = self.model(
             input_ids, positions, forward_batch
         )
-        return self.logits_processor(
+        logits_output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
             hidden_states_before_norm=hidden_states_before_norm,
         )
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         stacked_params_mapping = [
@@ -289,6 +299,87 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         ]
 
         params_dict = dict(self.named_parameters())
+        modules_dict = dict(self.named_modules())
+
+        def qkv_module_name(name: str) -> str:
+            for suffix in (
+                ".weight_scale_inv",
+                ".weight_scale_2",
+                ".weight_scale",
+                ".input_scale",
+                ".weight",
+                ".bias",
+            ):
+                if name.endswith(suffix):
+                    return name[: -len(suffix)]
+            return name
+
+        def is_mxfp8_mtp_qkv(name: str) -> bool:
+            if "self_attn.qkv_proj" not in name:
+                return False
+
+            module_name = qkv_module_name(name)
+            module = modules_dict.get(module_name)
+            quant_method = getattr(module, "quant_method", None)
+            quant_method_config = getattr(quant_method, "quant_config", None)
+            if getattr(quant_method, "use_mxfp8", False) or getattr(
+                quant_method_config, "use_mxfp8", False
+            ):
+                return True
+
+            quantized_layers = getattr(self.quant_config, "quantized_layers", None)
+            if not isinstance(quantized_layers, dict):
+                return False
+
+            candidates = [module_name]
+            if "model.mtp_block." in module_name:
+                tail = module_name.split("model.mtp_block.", 1)[1]
+                candidates.append(f"model.mtp.layers.{self.draft_model_idx}.{tail}")
+            elif "model.decoder." in module_name:
+                tail = module_name.split("model.decoder.", 1)[1]
+                candidates.append(f"model.mtp.layers.{self.draft_model_idx}.{tail}")
+
+            resolve_quant_algo = getattr(self.quant_config, "_resolve_quant_algo", None)
+            for candidate in candidates:
+                if callable(resolve_quant_algo):
+                    quant_algo = resolve_quant_algo(candidate)
+                    if isinstance(quant_algo, str) and quant_algo.upper() == "MXFP8":
+                        return True
+                layer_info = quantized_layers.get(candidate)
+                if (
+                    isinstance(layer_info, dict)
+                    and layer_info.get("quant_algo", "").upper() == "MXFP8"
+                ):
+                    return True
+            return False
+
+        def load_pre_sharded_mtp_qkv_if_needed(
+            name: str, param: torch.Tensor, loaded_weight: torch.Tensor
+        ) -> bool:
+            if "self_attn.qkv_proj" not in name:
+                return False
+
+            if is_mxfp8_mtp_qkv(name):
+                # Converted MXFP8 MTP qkv tensors use canonical fused
+                # [Q_all, K_all, V_all] layout with UE8M0 block scales.
+                # Let QKVParallelLinear split Q/K/V and TP shards.
+                return False
+
+            attn_tp_size = get_attention_tp_size()
+            if (
+                loaded_weight.dim() == 0
+                or loaded_weight.shape[0] != param.shape[0] * attn_tp_size
+            ):
+                return False
+
+            # MiMo V2 MTP fused qkv tensors are stored as TP-local
+            # [Q, K, V] chunks concatenated on dim 0. This is true for the
+            # official FP8 MTP tensors and for dequantized BF16 conversions of
+            # those tensors; dtype alone is not a reliable layout signal.
+            shard = loaded_weight.chunk(attn_tp_size, dim=0)[get_attention_tp_rank()]
+            default_weight_loader(param, shard)
+            return True
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
@@ -298,22 +389,23 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
+            if self.defer_shared_lm_head and "lm_head" in name:
+                continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             name = self.map_model_name_to_mtp_param_name(name)
 
-            # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
                     param = params_dict[name]
-                    load_mimo_v2_qkv_proj_weight(
-                        name,
-                        param,
-                        loaded_weight,
-                        expected_fused_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(
-                            self.config
-                        ),
+                    if load_pre_sharded_mtp_qkv_if_needed(
+                        name, param, loaded_weight
+                    ):
+                        continue
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
                     )
+                    weight_loader(param, loaded_weight)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -380,11 +472,14 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         return name
 
     def get_embed_and_head(self):
+        if not hasattr(self.lm_head, "weight"):
+            raise RuntimeError("deferred shared lm_head has not been attached")
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
-        del self.lm_head.weight
+        if hasattr(self.lm_head, "weight"):
+            del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()

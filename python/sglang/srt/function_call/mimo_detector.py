@@ -17,14 +17,21 @@ import html
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    ToolCallItem,
+    _GetInfoFunc,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_tool_name_for_lookup(tool_name: str) -> str:
+    return re.sub(r"[^0-9a-z]+", "", tool_name.casefold())
 
 
 def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
@@ -155,6 +162,61 @@ class MiMoDetector(BaseFormatDetector):
         self.param_regex = re.compile(
             r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL
         )
+        self.function_token = "<function="
+        self.parameter_token = "<parameter="
+        self.end_function_token = "</function>"
+        self.end_parameter_token = "</parameter>"
+        self._reset_streaming_tool_state()
+
+    def _get_normalized_tool_names(self, tools: List[Tool]) -> Dict[str, str]:
+        normalized_names = {}
+        ambiguous_names = set()
+        for tool in tools:
+            tool_name = tool.function.name
+            if not tool_name:
+                continue
+
+            normalized_name = _normalize_tool_name_for_lookup(tool_name)
+            if (
+                normalized_name in normalized_names
+                and normalized_names[normalized_name] != tool_name
+            ):
+                ambiguous_names.add(normalized_name)
+                continue
+
+            normalized_names[normalized_name] = tool_name
+
+        for normalized_name in ambiguous_names:
+            normalized_names.pop(normalized_name, None)
+        return normalized_names
+
+    def _resolve_tool_name(
+        self,
+        func_name: str,
+        tools: List[Tool],
+        tool_indices: Optional[Dict[str, int]] = None,
+    ) -> str:
+        tool_indices = tool_indices or self._get_tool_indices(tools)
+        if func_name in tool_indices:
+            return func_name
+
+        normalized_name = _normalize_tool_name_for_lookup(func_name)
+        return self._get_normalized_tool_names(tools).get(normalized_name, func_name)
+
+    def _tool_call_items_from_parsed(
+        self, parsed: Dict[str, Any], tool_indices: Dict[str, int]
+    ) -> List[ToolCallItem]:
+        func_name = parsed.get("name")
+        if not func_name:
+            return []
+
+        return [
+            ToolCallItem(
+                tool_index=tool_indices.get(func_name, -1),
+                name=func_name,
+                parameters=json.dumps(parsed.get("parameters", {}), ensure_ascii=False),
+            )
+        ]
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -169,7 +231,6 @@ class MiMoDetector(BaseFormatDetector):
         tool_indices = self._get_tool_indices(tools)
 
         calls = []
-        last_end = idx
 
         for match in self.tool_call_regex.finditer(text):
             tool_call_body = match.group(1)
@@ -179,73 +240,321 @@ class MiMoDetector(BaseFormatDetector):
             if parsed:
                 func_name = parsed.get("name")
                 if func_name not in tool_indices:
-                    # Unknown function
-                    logger.warning(f"Unknown function: {func_name}")
-                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                        # Return tool call block as normal text
-                        normal_text += text[last_end : match.end()]
-                        last_end = match.end()
-                        continue
-                calls.extend(self.parse_base_json(parsed, tools))
-
-            last_end = match.end()
+                    logger.debug("Forwarding unknown MiMo function: %s", func_name)
+                calls.extend(self._tool_call_items_from_parsed(parsed, tool_indices))
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming parsing: buffer until complete tool call block.
+        """Parse MiMo tool-call markup incrementally.
+
+        MiMo emits XML-ish tags that can be split across arbitrary chunks.  The
+        streaming API should not expose those tags as content, but it also
+        should not wait for the full ``</tool_call>`` block before exposing the
+        tool name and argument bytes.
         """
         self._buffer += new_text
-        current_text = self._buffer
+        normal_text = ""
+        calls = []
 
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            if self.current_tool_id > 0:
-                # Already processing tool calls, keep buffering
-                # (more tool calls might come, don't discard text yet)
-                return StreamingParseResult(normal_text="")
-            else:
-                # No tool calls seen yet, return as normal text
-                self._buffer = ""
-                return StreamingParseResult(normal_text=current_text)
+        while self._buffer:
+            if not self._streaming_in_tool_call:
+                start = self._buffer.find(self.bot_token)
+                if start == -1:
+                    keep = self._partial_suffix_len(self._buffer, [self.bot_token])
+                    emit_len = len(self._buffer) - keep
+                    normal_text += self._buffer[:emit_len]
+                    self._buffer = self._buffer[emit_len:]
+                    break
 
-        # Find end token AFTER the start token
-        end = current_text.find(self.eot_token, start)
-        if end == -1:
-            # Incomplete tool call, return text before start and keep buffering
-            normal_text = current_text[:start]
-            self._buffer = current_text[start:]
-            return StreamingParseResult(normal_text=normal_text)
+                normal_text += self._buffer[:start]
+                self._raw_tool_call_buffer = self.bot_token
+                self._buffer = self._buffer[start + len(self.bot_token) :]
+                self._streaming_in_tool_call = True
+                continue
 
-        # Parse the complete tool call block
-        result = self.detect_and_parse(current_text[: end + len(self.eot_token)], tools)
+            if not self._streaming_known_tool_call:
+                marker_idx, marker = self._find_first_marker(
+                    self._buffer, [self.function_token, self.eot_token]
+                )
+                if marker_idx == -1:
+                    keep = self._partial_suffix_len(
+                        self._buffer, [self.function_token, self.eot_token]
+                    )
+                    consume_len = len(self._buffer) - keep
+                    self._raw_tool_call_buffer += self._buffer[:consume_len]
+                    self._buffer = self._buffer[consume_len:]
+                    break
 
-        if result.calls:
-            # Valid tool call - initialize tracking if first one
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
+                self._raw_tool_call_buffer += self._buffer[:marker_idx]
+                self._buffer = self._buffer[marker_idx:]
 
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
+                if marker == self.eot_token:
+                    self._raw_tool_call_buffer += self.eot_token
+                    normal_text += self._raw_tool_call_buffer
+                    self._buffer = self._buffer[len(self.eot_token) :]
+                    self._reset_streaming_tool_state()
+                    continue
 
-            call = result.calls[0]
-            self.prev_tool_call_arr[self.current_tool_id] = {
-                "name": call.name,
-                "arguments": json.loads(call.parameters) if call.parameters else {},
-            }
-            self.streamed_args_for_tool[self.current_tool_id] = call.parameters
-            call.tool_index = self.current_tool_id
-            self.current_tool_id += 1
+                close = self._buffer.find(">", len(self.function_token))
+                if close == -1:
+                    break
 
-        self._buffer = current_text[end + len(self.eot_token) :]
-        return result
+                self._raw_tool_call_buffer += self._buffer[: close + 1]
+                raw_func_name = self._buffer[len(self.function_token) : close].strip()
+                self._buffer = self._buffer[close + 1 :]
+                self._start_streaming_function(raw_func_name, tools, calls)
+                continue
+
+            if self._streaming_param_name is not None:
+                marker_idx, marker = self._find_first_marker(
+                    self._buffer,
+                    [
+                        self.end_parameter_token,
+                        self.end_function_token,
+                        self.eot_token,
+                    ],
+                )
+                if marker_idx == -1:
+                    keep = self._partial_suffix_len(
+                        self._buffer,
+                        [
+                            self.end_parameter_token,
+                            self.end_function_token,
+                            self.eot_token,
+                        ],
+                    )
+                    consume_len = len(self._buffer) - keep
+                    value_text = self._buffer[:consume_len]
+                    self._raw_tool_call_buffer += value_text
+                    self._append_streaming_param_value(value_text, calls)
+                    self._buffer = self._buffer[consume_len:]
+                    break
+
+                value_text = self._buffer[:marker_idx]
+                self._raw_tool_call_buffer += value_text
+                self._append_streaming_param_value(value_text, calls)
+                self._buffer = self._buffer[marker_idx:]
+
+                if marker == self.end_parameter_token:
+                    self._raw_tool_call_buffer += self.end_parameter_token
+                    self._buffer = self._buffer[len(self.end_parameter_token) :]
+                    self._finish_streaming_param(tools, calls)
+                else:
+                    # Malformed but common enough during constrained decoding:
+                    # close the parameter implicitly and let the outer-state
+                    # branch consume </function> or </tool_call>.
+                    self._finish_streaming_param(tools, calls)
+                continue
+
+            marker_idx, marker = self._find_first_marker(
+                self._buffer,
+                [self.parameter_token, self.end_function_token, self.eot_token],
+            )
+            if marker_idx == -1:
+                keep = self._partial_suffix_len(
+                    self._buffer,
+                    [self.parameter_token, self.end_function_token, self.eot_token],
+                )
+                consume_len = len(self._buffer) - keep
+                self._raw_tool_call_buffer += self._buffer[:consume_len]
+                self._buffer = self._buffer[consume_len:]
+                break
+
+            self._raw_tool_call_buffer += self._buffer[:marker_idx]
+            self._buffer = self._buffer[marker_idx:]
+
+            if marker == self.parameter_token:
+                close = self._buffer.find(">", len(self.parameter_token))
+                if close == -1:
+                    break
+
+                self._raw_tool_call_buffer += self._buffer[: close + 1]
+                param_name = self._buffer[len(self.parameter_token) : close].strip()
+                self._buffer = self._buffer[close + 1 :]
+                self._start_streaming_param(param_name, tools, calls)
+                continue
+
+            if marker == self.end_function_token:
+                self._raw_tool_call_buffer += self.end_function_token
+                self._buffer = self._buffer[len(self.end_function_token) :]
+                self._finish_streaming_arguments(tools, calls)
+                continue
+
+            self._raw_tool_call_buffer += self.eot_token
+            self._buffer = self._buffer[len(self.eot_token) :]
+            self._finish_streaming_tool_call(tools, calls)
+
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    @staticmethod
+    def _find_first_marker(text: str, markers: Sequence[str]) -> Tuple[int, str]:
+        best_idx = -1
+        best_marker = ""
+        for marker in markers:
+            idx = text.find(marker)
+            if idx != -1 and (best_idx == -1 or idx < best_idx):
+                best_idx = idx
+                best_marker = marker
+        return best_idx, best_marker
+
+    @staticmethod
+    def _partial_suffix_len(text: str, markers: Sequence[str]) -> int:
+        keep = 0
+        for marker in markers:
+            max_len = min(len(text), len(marker) - 1)
+            for length in range(1, max_len + 1):
+                if marker.startswith(text[-length:]):
+                    keep = max(keep, length)
+        return keep
+
+    @staticmethod
+    def _json_string_fragment(text: str) -> str:
+        return json.dumps(text, ensure_ascii=False)[1:-1]
+
+    @staticmethod
+    def _streams_as_string(param_type: str) -> bool:
+        return param_type in ["string", "str", "text", "varchar", "char", "enum"]
+
+    def _reset_streaming_tool_state(self) -> None:
+        self._streaming_in_tool_call = False
+        self._streaming_known_tool_call = False
+        self._streaming_func_name = ""
+        self._streaming_param_name = None
+        self._streaming_param_value = ""
+        self._streaming_param_as_string = True
+        self._streaming_json_args_started = False
+        self._streaming_json_args_closed = False
+        self._streaming_json_param_open = False
+        self._raw_tool_call_buffer = ""
+
+    def _ensure_streaming_tool_slot(self, func_name: str) -> int:
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+
+        self.prev_tool_call_arr[self.current_tool_id] = {
+            "name": func_name,
+            "arguments": {},
+        }
+        self.streamed_args_for_tool[self.current_tool_id] = ""
+        return self.current_tool_id
+
+    def _append_streaming_arguments_chunk(self, chunk: str, calls: List[Any]) -> None:
+        if not chunk:
+            return
+
+        tool_index = self.current_tool_id
+        while len(self.streamed_args_for_tool) <= tool_index:
+            self.streamed_args_for_tool.append("")
+        self.streamed_args_for_tool[tool_index] += chunk
+        calls.append(ToolCallItem(tool_index=tool_index, parameters=chunk))
+
+    def _start_streaming_function(
+        self, func_name: str, tools: List[Tool], calls: List[Any]
+    ) -> None:
+        tool_indices = self._get_tool_indices(tools)
+        func_name = self._resolve_tool_name(func_name, tools, tool_indices)
+        if func_name not in tool_indices:
+            logger.debug("Forwarding unknown MiMo function: %s", func_name)
+
+        tool_index = self._ensure_streaming_tool_slot(func_name)
+        self._streaming_known_tool_call = True
+        self._streaming_func_name = func_name
+        self.current_tool_name_sent = True
+        calls.append(ToolCallItem(tool_index=tool_index, name=func_name, parameters=""))
+
+    def _start_streaming_param(
+        self, param_name: str, tools: List[Tool], calls: List[Any]
+    ) -> None:
+        if self._streaming_json_args_closed:
+            return
+
+        self._streaming_param_name = param_name
+        self._streaming_param_value = ""
+        param_type = _get_param_type(self._streaming_func_name, param_name, tools)
+        self._streaming_param_as_string = self._streams_as_string(param_type)
+        self._streaming_json_param_open = self._streaming_param_as_string
+
+        arguments = self.prev_tool_call_arr[self.current_tool_id]["arguments"]
+        arguments[param_name] = ""
+
+        prefix = ", " if self._streaming_json_args_started else "{"
+        prefix += f"{json.dumps(param_name, ensure_ascii=False)}: "
+        if self._streaming_param_as_string:
+            prefix += '"'
+        self._streaming_json_args_started = True
+        self._append_streaming_arguments_chunk(prefix, calls)
+
+    def _append_streaming_param_value(self, value_text: str, calls: List[Any]) -> None:
+        if not value_text or self._streaming_param_name is None:
+            return
+
+        self._streaming_param_value += value_text
+        if self._streaming_param_as_string:
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"][
+                self._streaming_param_name
+            ] = self._streaming_param_value
+            self._append_streaming_arguments_chunk(
+                self._json_string_fragment(value_text), calls
+            )
+
+    def _finish_streaming_param(self, tools: List[Tool], calls: List[Any]) -> None:
+        if self._streaming_param_name is None:
+            return
+
+        param_name = self._streaming_param_name
+        param_value = self._streaming_param_value
+
+        if self._streaming_param_as_string:
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"][param_name] = (
+                param_value
+            )
+            if self._streaming_json_param_open:
+                self._append_streaming_arguments_chunk('"', calls)
+        else:
+            converted_value = _convert_param_value(
+                param_value, param_name, self._streaming_func_name, tools
+            )
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"][param_name] = (
+                converted_value
+            )
+            self._append_streaming_arguments_chunk(
+                json.dumps(converted_value, ensure_ascii=False), calls
+            )
+
+        self._streaming_param_name = None
+        self._streaming_param_value = ""
+        self._streaming_param_as_string = True
+        self._streaming_json_param_open = False
+
+    def _finish_streaming_arguments(self, tools: List[Tool], calls: List[Any]) -> None:
+        if self._streaming_json_args_closed:
+            return
+
+        if self._streaming_param_name is not None:
+            self._finish_streaming_param(tools, calls)
+
+        if self._streaming_json_args_started:
+            self._append_streaming_arguments_chunk("}", calls)
+        else:
+            self._append_streaming_arguments_chunk("{}", calls)
+
+        self._streaming_json_args_closed = True
+
+    def _finish_streaming_tool_call(self, tools: List[Tool], calls: List[Any]) -> None:
+        self._finish_streaming_arguments(tools, calls)
+        self.current_tool_name_sent = False
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+        self.current_tool_id += 1
+        self._reset_streaming_tool_state()
 
     def _parse_tool_call(
         self, tool_call_body: str, tools: List[Tool]
@@ -262,6 +571,7 @@ class MiMoDetector(BaseFormatDetector):
             return None
 
         func_name = func_match.group(1).strip()
+        func_name = self._resolve_tool_name(func_name, tools)
         func_body = func_match.group(2)
 
         params = {}
