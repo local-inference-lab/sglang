@@ -14,11 +14,13 @@
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
+import json
 import logging
 import os
 from typing import Iterable, Optional, Tuple
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
@@ -66,6 +68,64 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+def _get_local_model_path(config: PretrainedConfig) -> Optional[str]:
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = getattr(config, attr, None)
+        if model_path and os.path.isdir(model_path):
+            return model_path
+
+    try:
+        server_args = get_global_server_args()
+    except Exception:
+        return None
+
+    for model_path in (
+        getattr(server_args, "speculative_draft_model_path", None),
+        getattr(server_args, "model_path", None),
+    ):
+        if model_path and os.path.isdir(model_path):
+            return model_path
+    return None
+
+
+def _has_serialized_modelopt_fp4_nextn_experts(config: PretrainedConfig) -> bool:
+    model_path = _get_local_model_path(config)
+    if model_path is None:
+        return False
+
+    nextn_layer_id = getattr(config, "num_hidden_layers", None)
+    if nextn_layer_id is None:
+        return False
+
+    probe_prefix = f"model.layers.{nextn_layer_id}.mlp.experts.0.down_proj"
+    probe_weight = f"{probe_prefix}.weight"
+    required_keys = {
+        probe_weight,
+        f"{probe_prefix}.weight_scale",
+        f"{probe_prefix}.weight_scale_2",
+        f"{probe_prefix}.input_scale",
+    }
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return False
+
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        if not required_keys.issubset(weight_map):
+            return False
+
+        shard_path = os.path.join(model_path, weight_map[probe_weight])
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            return f.get_slice(probe_weight).get_dtype() == "U8"
+    except Exception as err:
+        logger.warning(
+            "Failed to inspect serialized NextN expert quantization metadata: %s",
+            err,
+        )
+        return False
+
+
 class DeepseekModelNextN(nn.Module):
 
     def __init__(
@@ -84,9 +144,15 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not _has_serialized_modelopt_fp4_nextn_experts(config)
+        ):
             logger.warning(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+                "Overriding DeepseekV3ForCausalLMNextN quant config for "
+                "modelopt_fp4 Deepseek model because serialized NextN FP4 "
+                "expert weights were not found."
             )
             quant_config = None
 
