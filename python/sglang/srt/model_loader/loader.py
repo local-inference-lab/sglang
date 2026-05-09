@@ -93,6 +93,7 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
+    get_safetensors_indexed_keys_by_file,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
@@ -328,6 +329,12 @@ class DefaultModelLoader(BaseModelLoader):
     DEFAULT_NUM_THREADS = 8
 
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
+    _INDEX_FILTER_NEXTN_ARCHITECTURES = {
+        "BailingMoeForCausalLMNextN",
+        "DeepseekV3ForCausalLMNextN",
+        "Glm4MoeForCausalLMNextN",
+        "GlmOcrForConditionalGenerationNextN",
+    }
 
     @dataclasses.dataclass
     class Source:
@@ -496,6 +503,84 @@ class DefaultModelLoader(BaseModelLoader):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    def _maybe_filter_nextn_draft_safetensors(
+        self,
+        source: "Source",
+        hf_weights_files: List[str],
+        indexed_keys_by_file: Optional[Dict[str, set[str]]],
+    ) -> Tuple[List[str], Optional[Dict[str, set[str]]]]:
+        """Use the safetensors index as a read plan for single-layer NextN drafts."""
+        if indexed_keys_by_file is None or source.model_config is None:
+            return hf_weights_files, indexed_keys_by_file
+
+        model_config = source.model_config
+        if not model_config.is_draft_model:
+            return hf_weights_files, indexed_keys_by_file
+
+        # If we have auto-added shards that are not represented in the index,
+        # keep the conservative full file list.
+        if any(st_file not in indexed_keys_by_file for st_file in hf_weights_files):
+            return hf_weights_files, indexed_keys_by_file
+
+        hf_config = model_config.hf_config
+        architectures = getattr(hf_config, "architectures", None) or []
+        arch = architectures[0] if architectures else None
+        if arch not in self._INDEX_FILTER_NEXTN_ARCHITECTURES:
+            return hf_weights_files, indexed_keys_by_file
+
+        hf_text_config = getattr(hf_config, "text_config", hf_config)
+        num_nextn_layers = getattr(
+            hf_text_config,
+            "num_nextn_predict_layers",
+            getattr(hf_config, "num_nextn_predict_layers", 0),
+        )
+        if num_nextn_layers != 1 or self.load_config.draft_model_idx not in (None, 0):
+            return hf_weights_files, indexed_keys_by_file
+
+        num_hidden_layers = getattr(
+            hf_text_config,
+            "num_hidden_layers",
+            getattr(hf_config, "num_hidden_layers", None),
+        )
+        if num_hidden_layers is None:
+            return hf_weights_files, indexed_keys_by_file
+
+        nextn_layer_id = 0 if int(num_hidden_layers) == 1 else int(num_hidden_layers)
+        nextn_prefix = f"model.layers.{nextn_layer_id}."
+        filtered_keys_by_file: Dict[str, set[str]] = {}
+        for st_file, keys in indexed_keys_by_file.items():
+            matched_keys = {key for key in keys if key.startswith(nextn_prefix)}
+            if matched_keys:
+                filtered_keys_by_file[st_file] = matched_keys
+
+        if not filtered_keys_by_file:
+            return hf_weights_files, indexed_keys_by_file
+
+        filtered_weight_files = [
+            st_file for st_file in hf_weights_files if st_file in filtered_keys_by_file
+        ]
+        if not filtered_weight_files:
+            return hf_weights_files, indexed_keys_by_file
+
+        old_key_count = sum(len(keys) for keys in indexed_keys_by_file.values())
+        new_key_count = sum(len(keys) for keys in filtered_keys_by_file.values())
+        if new_key_count >= old_key_count and len(filtered_weight_files) >= len(
+            hf_weights_files
+        ):
+            return hf_weights_files, indexed_keys_by_file
+
+        if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                "Using safetensors index to restrict NextN draft load to "
+                "%d/%d tensors across %d/%d files (prefix: %s).",
+                new_key_count,
+                old_key_count,
+                len(filtered_weight_files),
+                len(hf_weights_files),
+                nextn_prefix,
+            )
+        return filtered_weight_files, filtered_keys_by_file
+
     def _get_weights_iterator(
         self, source: "Source"
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
@@ -505,6 +590,7 @@ class DefaultModelLoader(BaseModelLoader):
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+        indexed_keys_by_file = None
 
         if use_safetensors and source.model_config is not None:
             hf_weights_files = maybe_add_mtp_safetensors(
@@ -512,6 +598,20 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_folder,
                 "model.safetensors.index.json",
                 source.model_config.hf_config,
+            )
+        if use_safetensors:
+            index_file = (
+                "consolidated.safetensors.index.json"
+                if self.load_config.load_format == LoadFormat.MISTRAL
+                else "model.safetensors.index.json"
+            )
+            indexed_keys_by_file = get_safetensors_indexed_keys_by_file(
+                hf_weights_files, hf_folder, index_file
+            )
+            hf_weights_files, indexed_keys_by_file = (
+                self._maybe_filter_nextn_draft_safetensors(
+                    source, hf_weights_files, indexed_keys_by_file
+                )
             )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
@@ -532,6 +632,7 @@ class DefaultModelLoader(BaseModelLoader):
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    indexed_keys_by_file=indexed_keys_by_file,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -542,6 +643,7 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
+                    indexed_keys_by_file=indexed_keys_by_file,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -549,6 +651,7 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
+                    indexed_keys_by_file=indexed_keys_by_file,
                 )
 
         else:
