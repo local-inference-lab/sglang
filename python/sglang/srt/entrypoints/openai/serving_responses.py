@@ -1264,7 +1264,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         context: ConversationContext,
         raw_request: Optional[Request] = None,
         priority: Optional[int] = None,
-        **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
         orig_priority = priority or 0
@@ -1318,11 +1317,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 remaining_tokens = (
                     context_len - len(prompt_token_ids) - num_reserved_tokens
                 )
+                next_max_new_tokens = max(remaining_tokens, 1)
 
                 if isinstance(sampling_params, dict):
-                    sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
+                    sampling_params["max_new_tokens"] = next_max_new_tokens
                 else:
-                    sampling_params.max_new_tokens = max(remaining_tokens, 1)
+                    sampling_params.max_new_tokens = next_max_new_tokens
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1

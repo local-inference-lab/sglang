@@ -1,3 +1,4 @@
+from sglang.srt.sampling.penaltylib.entropy_penalty import BatchedEntropyPenalizer
 from sglang.srt.sampling.penaltylib.frequency_penalty import BatchedFrequencyPenalizer
 from sglang.srt.sampling.penaltylib.min_new_tokens import BatchedMinNewTokensPenalizer
 from sglang.srt.sampling.penaltylib.orchestrator import BatchedPenalizerOrchestrator
@@ -5,6 +6,7 @@ from sglang.srt.sampling.penaltylib.presence_penalty import BatchedPresencePenal
 from sglang.srt.sampling.penaltylib.repetition_penalty import BatchedRepetitionPenalizer
 
 __all__ = [
+    "BatchedEntropyPenalizer",
     "BatchedFrequencyPenalizer",
     "BatchedMinNewTokensPenalizer",
     "BatchedPresencePenalizer",

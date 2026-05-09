@@ -17,7 +17,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestSamplingParamsInit(CustomTestCase):
-
     def test_zero_temperature_becomes_greedy(self):
         """Test greedy conversion when temperature is 0."""
         sp = SamplingParams(temperature=0.0)
@@ -68,9 +67,59 @@ class TestSamplingParamsInit(CustomTestCase):
         sp = SamplingParams(stop_token_ids=[])
         self.assertIsNone(sp.stop_token_ids)
 
+    def test_entropy_penalty_defaults(self):
+        """Test the default long-span repetition penalty settings."""
+        sp = SamplingParams()
+        self.assertEqual(sp.entropy_penalty, 0.0)
+        self.assertEqual(sp.entropy_penalty_min_len, 16)
+        self.assertEqual(sp.entropy_penalty_max_len, 256)
+        self.assertEqual(sp.entropy_penalty_window, 8192)
+        self.assertEqual(sp.entropy_penalty_max_penalty, 8.0)
+        self.assertEqual(sp.entropy_penalty_min_repetitions, 1)
+
+    def test_entropy_penalty_none_uses_defaults(self):
+        """Test that null entropy penalty params fall back to defaults."""
+        sp = SamplingParams(
+            entropy_penalty=None,
+            entropy_penalty_min_len=None,
+            entropy_penalty_max_len=None,
+            entropy_penalty_window=None,
+            entropy_penalty_max_penalty=None,
+            entropy_penalty_min_repetitions=None,
+        )
+        self.assertEqual(sp.entropy_penalty, 0.0)
+        self.assertEqual(sp.entropy_penalty_min_len, 16)
+        self.assertEqual(sp.entropy_penalty_max_len, 256)
+        self.assertEqual(sp.entropy_penalty_window, 8192)
+        self.assertEqual(sp.entropy_penalty_max_penalty, 8.0)
+        self.assertEqual(sp.entropy_penalty_min_repetitions, 1)
+
+    def test_thinking_end_logit_boost_defaults(self):
+        """Test default thinking end logit boost settings."""
+        sp = SamplingParams()
+        self.assertEqual(sp.thinking_end_logit_boost, 0.0)
+        self.assertEqual(sp.thinking_end_logit_boost_start, 0)
+        self.assertEqual(sp.thinking_end_logit_boost_ramp, 256)
+        self.assertIsNone(sp.thinking_start_token_id)
+        self.assertIsNone(sp.thinking_end_token_id)
+
+    def test_thinking_end_logit_boost_none_uses_defaults(self):
+        """Test that null thinking boost params fall back to defaults."""
+        sp = SamplingParams(
+            thinking_end_logit_boost=None,
+            thinking_end_logit_boost_start=None,
+            thinking_end_logit_boost_ramp=None,
+            thinking_start_token_id=None,
+            thinking_end_token_id=None,
+        )
+        self.assertEqual(sp.thinking_end_logit_boost, 0.0)
+        self.assertEqual(sp.thinking_end_logit_boost_start, 0)
+        self.assertEqual(sp.thinking_end_logit_boost_ramp, 256)
+        self.assertIsNone(sp.thinking_start_token_id)
+        self.assertIsNone(sp.thinking_end_token_id)
+
 
 class TestSamplingParamsVerify(CustomTestCase):
-
     VOCAB_SIZE = 32000
 
     def _make(self, **kwargs):
@@ -194,6 +243,111 @@ class TestSamplingParamsVerify(CustomTestCase):
         self._make(repetition_penalty=0.0).verify(self.VOCAB_SIZE)
         self._make(repetition_penalty=2.0).verify(self.VOCAB_SIZE)
 
+    # --- entropy_penalty ---
+    def test_entropy_penalty_negative_raises(self):
+        """Test that verify() rejects negative entropy_penalty."""
+        sp = self._make(entropy_penalty=-0.1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_entropy_penalty_zero_min_len_raises(self):
+        """Test that entropy_penalty_min_len must be at least 1."""
+        sp = self._make(entropy_penalty_min_len=0)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_entropy_penalty_max_len_below_min_len_raises(self):
+        """Test that entropy_penalty_max_len cannot be below min_len."""
+        sp = self._make(entropy_penalty_min_len=8, entropy_penalty_max_len=7)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_entropy_penalty_window_below_max_len_raises(self):
+        """Test that the history window must cover max_len."""
+        sp = self._make(entropy_penalty_max_len=32, entropy_penalty_window=31)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_entropy_penalty_max_penalty_negative_raises(self):
+        """Test that verify() rejects a negative entropy penalty cap."""
+        sp = self._make(entropy_penalty_max_penalty=-0.1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_entropy_penalty_zero_min_repetitions_raises(self):
+        """Test that entropy_penalty_min_repetitions must be at least 1."""
+        sp = self._make(entropy_penalty_min_repetitions=0)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_entropy_penalty_boundaries_valid(self):
+        """Test valid entropy_penalty boundary values."""
+        sp = self._make(
+            entropy_penalty=0.0,
+            entropy_penalty_min_len=1,
+            entropy_penalty_max_len=1,
+            entropy_penalty_window=1,
+            entropy_penalty_max_penalty=0.0,
+            entropy_penalty_min_repetitions=1,
+        )
+        sp.verify(self.VOCAB_SIZE)
+
+    # --- thinking_end_logit_boost ---
+    def test_thinking_end_logit_boost_negative_raises(self):
+        """Test that verify() rejects negative thinking end logit boost."""
+        sp = self._make(thinking_end_logit_boost=-0.1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_thinking_end_logit_boost_negative_start_raises(self):
+        """Test that verify() rejects negative thinking boost cut-in."""
+        sp = self._make(thinking_end_logit_boost_start=-1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_thinking_end_logit_boost_negative_ramp_raises(self):
+        """Test that verify() rejects negative thinking boost ramp."""
+        sp = self._make(thinking_end_logit_boost_ramp=-1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_thinking_end_logit_boost_requires_token_ids(self):
+        """Test that enabled boost requires resolvable thinking marker token IDs."""
+        sp = self._make(thinking_end_logit_boost=1.0)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_thinking_end_logit_boost_token_id_out_of_vocab_raises(self):
+        """Test that marker token IDs must be in the vocabulary."""
+        sp = self._make(
+            thinking_end_logit_boost=1.0,
+            thinking_start_token_id=1,
+            thinking_end_token_id=self.VOCAB_SIZE,
+        )
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_thinking_end_logit_boost_same_token_ids_raises(self):
+        """Test that start and end marker token IDs must differ."""
+        sp = self._make(
+            thinking_end_logit_boost=1.0,
+            thinking_start_token_id=42,
+            thinking_end_token_id=42,
+        )
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_thinking_end_logit_boost_valid(self):
+        """Test valid thinking end boost settings."""
+        sp = self._make(
+            thinking_end_logit_boost=2.5,
+            thinking_end_logit_boost_start=8,
+            thinking_end_logit_boost_ramp=32,
+            thinking_start_token_id=11,
+            thinking_end_token_id=12,
+        )
+        sp.verify(self.VOCAB_SIZE)
+
     # --- min_new_tokens / max_new_tokens ---
     def test_negative_min_new_tokens_raises(self):
         """Test that verify() rejects negative min_new_tokens."""
@@ -260,7 +414,6 @@ class TestSamplingParamsVerify(CustomTestCase):
 
 
 class TestSamplingParamsNormalize(CustomTestCase):
-
     def test_none_stop_strs_becomes_empty_list(self):
         """Test that normalize() converts None stop to empty list with max_len=0."""
         sp = SamplingParams(stop=None)
@@ -298,6 +451,23 @@ class TestSamplingParamsNormalize(CustomTestCase):
         sp.normalize(tokenizer=tokenizer)
         self.assertEqual(sp.stop_str_max_len, 3)
 
+    def test_thinking_end_logit_boost_infers_marker_token_ids(self):
+        """Test that normalize() infers single-token thinking marker IDs."""
+        tokenizer = MagicMock()
+
+        def encode(text, add_special_tokens=False):
+            if text == "<think>":
+                return [11]
+            if text == "</think>":
+                return [12]
+            return [1, 2]
+
+        tokenizer.encode.side_effect = encode
+        sp = SamplingParams(thinking_end_logit_boost=2.0)
+        sp.normalize(tokenizer=tokenizer)
+        self.assertEqual(sp.thinking_start_token_id, 11)
+        self.assertEqual(sp.thinking_end_token_id, 12)
+
     def test_none_stop_regex_becomes_empty_list(self):
         """Test that normalize() converts None stop_regex to empty list with max_len=0."""
         sp = SamplingParams(stop_regex=None)
@@ -319,7 +489,6 @@ class TestSamplingParamsNormalize(CustomTestCase):
 
 
 class TestRegexMaxLength(CustomTestCase):
-
     def test_literal_string(self):
         """Test that plain string 'abc' gives max length 3."""
         self.assertEqual(get_max_seq_length("abc"), 3)

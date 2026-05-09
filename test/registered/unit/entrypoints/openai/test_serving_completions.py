@@ -18,7 +18,10 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    TokenizerManager,
+    merge_preferred_sampling_params,
+)
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -164,6 +167,178 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Should not have json_schema or structural_tag from response_format
         # (but might have json_schema from the legacy json_schema field)
         self.assertIsNone(sampling_params.get("structural_tag"))
+
+    def test_entropy_penalty_sampling_params(self):
+        """Test completion entropy_penalty fields are forwarded."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate text:",
+            max_tokens=100,
+            entropy_penalty=1.5,
+            entropy_penalty_min_len=8,
+            entropy_penalty_max_len=64,
+            entropy_penalty_window=512,
+            entropy_penalty_max_penalty=4.0,
+            entropy_penalty_min_repetitions=3,
+        )
+        sampling_params = self.sc._build_sampling_params(req)
+        self.assertEqual(sampling_params["entropy_penalty"], 1.5)
+        self.assertEqual(sampling_params["entropy_penalty_min_len"], 8)
+        self.assertEqual(sampling_params["entropy_penalty_max_len"], 64)
+        self.assertEqual(sampling_params["entropy_penalty_window"], 512)
+        self.assertEqual(sampling_params["entropy_penalty_max_penalty"], 4.0)
+        self.assertEqual(sampling_params["entropy_penalty_min_repetitions"], 3)
+
+    def test_thinking_end_logit_boost_sampling_params(self):
+        """Test completion thinking boost fields are forwarded."""
+        req = CompletionRequest(
+            model="x",
+            prompt="Generate text:",
+            max_tokens=100,
+            thinking_end_logit_boost=2.5,
+            thinking_end_logit_boost_start=24,
+            thinking_end_logit_boost_ramp=128,
+            thinking_start_token_id=11,
+            thinking_end_token_id=12,
+        )
+        sampling_params = self.sc._build_sampling_params(req)
+        self.assertEqual(sampling_params["thinking_end_logit_boost"], 2.5)
+        self.assertEqual(sampling_params["thinking_end_logit_boost_start"], 24)
+        self.assertEqual(sampling_params["thinking_end_logit_boost_ramp"], 128)
+        self.assertEqual(sampling_params["thinking_start_token_id"], 11)
+        self.assertEqual(sampling_params["thinking_end_token_id"], 12)
+
+    def test_omitted_entropy_params_do_not_override_preferred_defaults(self):
+        req = CompletionRequest(model="x", prompt="Generate text:", max_tokens=100)
+        sampling_params = self.sc._build_sampling_params(req)
+
+        preferred = {
+            "entropy_penalty": 0.8,
+            "entropy_penalty_min_len": 16,
+            "entropy_penalty_max_len": 512,
+            "entropy_penalty_window": 8192,
+            "entropy_penalty_max_penalty": 12.0,
+            "entropy_penalty_min_repetitions": 2,
+        }
+        merged = merge_preferred_sampling_params(preferred, sampling_params)
+
+        self.assertEqual(merged["entropy_penalty"], 0.8)
+        self.assertEqual(merged["entropy_penalty_max_penalty"], 12.0)
+        self.assertEqual(merged["entropy_penalty_min_repetitions"], 2)
+
+    def test_omitted_thinking_boost_params_do_not_override_preferred_defaults(self):
+        req = CompletionRequest(model="x", prompt="Generate text:", max_tokens=100)
+        sampling_params = self.sc._build_sampling_params(req)
+
+        preferred = {
+            "thinking_end_logit_boost": 2.5,
+            "thinking_end_logit_boost_start": 32,
+            "thinking_end_logit_boost_ramp": 256,
+            "thinking_start_token_id": 11,
+            "thinking_end_token_id": 12,
+        }
+        merged = merge_preferred_sampling_params(preferred, sampling_params)
+
+        self.assertEqual(merged["thinking_end_logit_boost"], 2.5)
+        self.assertEqual(merged["thinking_end_logit_boost_start"], 32)
+        self.assertEqual(merged["thinking_end_logit_boost_ramp"], 256)
+        self.assertEqual(merged["thinking_start_token_id"], 11)
+        self.assertEqual(merged["thinking_end_token_id"], 12)
+
+    def test_preferred_merge_preserves_non_entropy_none_values(self):
+        preferred = {
+            "entropy_penalty": 0.8,
+            "entropy_penalty_max_penalty": 12.0,
+            "entropy_penalty_min_repetitions": 2,
+            "max_new_tokens": 4096,
+            "temperature": 0.2,
+            "logit_bias": {"52592": -1e9, "33763": -1e9},
+        }
+        sampling_params = {
+            "entropy_penalty": None,
+            "entropy_penalty_max_penalty": None,
+            "entropy_penalty_min_repetitions": None,
+            "max_new_tokens": None,
+            "temperature": None,
+            "logit_bias": None,
+        }
+        merged = merge_preferred_sampling_params(preferred, sampling_params)
+
+        self.assertEqual(merged["entropy_penalty"], 0.8)
+        self.assertEqual(merged["entropy_penalty_max_penalty"], 12.0)
+        self.assertEqual(merged["entropy_penalty_min_repetitions"], 2)
+        self.assertIsNone(merged["max_new_tokens"])
+        self.assertIsNone(merged["temperature"])
+        self.assertEqual(merged["logit_bias"], {"52592": -1e9, "33763": -1e9})
+
+    def test_preferred_logit_bias_is_forced_when_request_has_bias(self):
+        preferred = {
+            "logit_bias": {"52592": -1e9, "33763": -1e9},
+        }
+        sampling_params = {
+            "max_new_tokens": None,
+            "logit_bias": {"123": -3.0, "52592": 0.0},
+        }
+        merged = merge_preferred_sampling_params(preferred, sampling_params)
+
+        self.assertIsNone(merged["max_new_tokens"])
+        self.assertEqual(
+            merged["logit_bias"],
+            {"123": -3.0, "52592": -1e9, "33763": -1e9},
+        )
+
+    def test_thought_loop_preset_as_preferred_sampling_params(self):
+        preferred = {
+            "entropy_penalty": 2.0,
+            "entropy_penalty_min_len": 16,
+            "entropy_penalty_max_len": 512,
+            "entropy_penalty_window": 8192,
+            "entropy_penalty_max_penalty": 512.0,
+            "entropy_penalty_min_repetitions": 2,
+            "logit_bias": {"52592": -1e9, "33763": -1e9},
+        }
+        merged = merge_preferred_sampling_params(
+            preferred,
+            {
+                "max_new_tokens": None,
+                "entropy_penalty": None,
+                "logit_bias": None,
+            },
+        )
+
+        self.assertEqual(merged["entropy_penalty"], 2.0)
+        self.assertEqual(merged["entropy_penalty_min_len"], 16)
+        self.assertEqual(merged["entropy_penalty_max_len"], 512)
+        self.assertEqual(merged["entropy_penalty_window"], 8192)
+        self.assertEqual(merged["entropy_penalty_max_penalty"], 512.0)
+        self.assertEqual(merged["entropy_penalty_min_repetitions"], 2)
+        self.assertIsNone(merged["max_new_tokens"])
+        self.assertEqual(merged["logit_bias"], {"52592": -1e9, "33763": -1e9})
+
+    def test_preferred_entropy_can_be_overridden_by_explicit_request_value(self):
+        preferred = {
+            "entropy_penalty": 2.0,
+            "entropy_penalty_min_len": 16,
+            "entropy_penalty_max_len": 512,
+            "logit_bias": {"52592": -1e9, "33763": -1e9},
+        }
+        merged = merge_preferred_sampling_params(
+            preferred,
+            {
+                "max_new_tokens": None,
+                "entropy_penalty": 0.5,
+                "logit_bias": {"123": -3.0, "52592": 0.0},
+            },
+        )
+
+        self.assertEqual(merged["entropy_penalty"], 0.5)
+        self.assertEqual(merged["entropy_penalty_min_len"], 16)
+        self.assertEqual(merged["entropy_penalty_max_len"], 512)
+        self.assertIsNone(merged["max_new_tokens"])
+        self.assertEqual(
+            merged["logit_bias"],
+            {"123": -3.0, "52592": -1e9, "33763": -1e9},
+        )
 
     def test_logprobs_false_non_streaming(self):
         """Test that logprobs=False doesn't cause KeyError in non-streaming response."""

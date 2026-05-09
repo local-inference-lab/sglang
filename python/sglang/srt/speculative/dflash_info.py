@@ -352,6 +352,7 @@ class DFlashVerifyInput(SpecInput):
             if (
                 sampling_info.penalizer_orchestrator.is_required
                 or sampling_info.logit_bias is not None
+                or sampling_info.has_thinking_end_logit_boost
             ):
                 linear_penalty = torch.zeros(
                     (bs, logits_output.next_token_logits.shape[1]),

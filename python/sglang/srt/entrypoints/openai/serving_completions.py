@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
     SglExt,
+    _explicit_request_value,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -149,6 +150,37 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
             "repetition_penalty": request.repetition_penalty,
+            "entropy_penalty": _explicit_request_value(request, "entropy_penalty"),
+            "entropy_penalty_min_len": _explicit_request_value(
+                request, "entropy_penalty_min_len"
+            ),
+            "entropy_penalty_max_len": _explicit_request_value(
+                request, "entropy_penalty_max_len"
+            ),
+            "entropy_penalty_window": _explicit_request_value(
+                request, "entropy_penalty_window"
+            ),
+            "entropy_penalty_max_penalty": _explicit_request_value(
+                request, "entropy_penalty_max_penalty"
+            ),
+            "entropy_penalty_min_repetitions": _explicit_request_value(
+                request, "entropy_penalty_min_repetitions"
+            ),
+            "thinking_end_logit_boost": _explicit_request_value(
+                request, "thinking_end_logit_boost"
+            ),
+            "thinking_end_logit_boost_start": _explicit_request_value(
+                request, "thinking_end_logit_boost_start"
+            ),
+            "thinking_end_logit_boost_ramp": _explicit_request_value(
+                request, "thinking_end_logit_boost_ramp"
+            ),
+            "thinking_start_token_id": _explicit_request_value(
+                request, "thinking_start_token_id"
+            ),
+            "thinking_end_token_id": _explicit_request_value(
+                request, "thinking_end_token_id"
+            ),
             "regex": request.regex,
             "json_schema": request.json_schema,
             "ebnf": request.ebnf,
@@ -289,9 +321,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_top_logprobs = content["meta_info"].get(
                             "output_top_logprobs", []
                         )
-                        if (
-                            not self.tokenizer_manager.server_args.incremental_streaming_output
-                        ):
+                        if not self.tokenizer_manager.server_args.incremental_streaming_output:
                             output_token_logprobs = output_token_logprobs[
                                 n_prev_token:total_output_logprobs
                             ]

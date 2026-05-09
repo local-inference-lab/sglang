@@ -28,6 +28,12 @@ class SglSamplingParams:
     min_p: float = 0.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    entropy_penalty: float = 0.0
+    entropy_penalty_min_len: int = 16
+    entropy_penalty_max_len: int = 256
+    entropy_penalty_window: int = 8192
+    entropy_penalty_max_penalty: float = 8.0
+    entropy_penalty_min_repetitions: int = 1
     ignore_eos: bool = False
     return_logprob: Optional[bool] = None
     logprob_start_len: Optional[int] = (None,)
@@ -41,24 +47,32 @@ class SglSamplingParams:
 
     def clone(self):
         return SglSamplingParams(
-            self.max_new_tokens,
-            self.min_new_tokens,
-            self.n,
-            self.stop,
-            self.stop_token_ids,
-            self.stop_regex,
-            self.temperature,
-            self.top_p,
-            self.top_k,
-            self.min_p,
-            self.frequency_penalty,
-            self.presence_penalty,
-            self.ignore_eos,
-            self.return_logprob,
-            self.logprob_start_len,
-            self.top_logprobs_num,
-            self.return_text_in_logprobs,
-            self.json_schema,
+            max_new_tokens=self.max_new_tokens,
+            min_new_tokens=self.min_new_tokens,
+            n=self.n,
+            stop=self.stop,
+            stop_token_ids=self.stop_token_ids,
+            stop_regex=self.stop_regex,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            frequency_penalty=self.frequency_penalty,
+            presence_penalty=self.presence_penalty,
+            entropy_penalty=self.entropy_penalty,
+            entropy_penalty_min_len=self.entropy_penalty_min_len,
+            entropy_penalty_max_len=self.entropy_penalty_max_len,
+            entropy_penalty_window=self.entropy_penalty_window,
+            entropy_penalty_max_penalty=self.entropy_penalty_max_penalty,
+            entropy_penalty_min_repetitions=self.entropy_penalty_min_repetitions,
+            ignore_eos=self.ignore_eos,
+            return_logprob=self.return_logprob,
+            logprob_start_len=self.logprob_start_len,
+            top_logprobs_num=self.top_logprobs_num,
+            return_text_in_logprobs=self.return_text_in_logprobs,
+            json_schema=self.json_schema,
+            dtype=self.dtype,
+            regex=self.regex,
         )
 
     def to_openai_kwargs(self):
@@ -132,6 +146,12 @@ class SglSamplingParams:
             "min_p": self.min_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
+            "entropy_penalty": self.entropy_penalty,
+            "entropy_penalty_min_len": self.entropy_penalty_min_len,
+            "entropy_penalty_max_len": self.entropy_penalty_max_len,
+            "entropy_penalty_window": self.entropy_penalty_window,
+            "entropy_penalty_max_penalty": self.entropy_penalty_max_penalty,
+            "entropy_penalty_min_repetitions": self.entropy_penalty_min_repetitions,
             "ignore_eos": self.ignore_eos,
             "regex": self.regex,
             "json_schema": self.json_schema,
@@ -171,6 +191,12 @@ class SglFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        entropy_penalty: float = 0.0,
+        entropy_penalty_min_len: int = 16,
+        entropy_penalty_max_len: int = 256,
+        entropy_penalty_window: int = 8192,
+        entropy_penalty_max_penalty: float = 8.0,
+        entropy_penalty_min_repetitions: int = 1,
         ignore_eos: bool = False,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
@@ -203,6 +229,12 @@ class SglFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            entropy_penalty=entropy_penalty,
+            entropy_penalty_min_len=entropy_penalty_min_len,
+            entropy_penalty_max_len=entropy_penalty_max_len,
+            entropy_penalty_window=entropy_penalty_window,
+            entropy_penalty_max_penalty=entropy_penalty_max_penalty,
+            entropy_penalty_min_repetitions=entropy_penalty_min_repetitions,
             ignore_eos=ignore_eos,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -235,6 +267,12 @@ class SglFunction:
         min_p: float = 0.0,
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
+        entropy_penalty: float = 0.0,
+        entropy_penalty_min_len: int = 16,
+        entropy_penalty_max_len: int = 256,
+        entropy_penalty_window: int = 8192,
+        entropy_penalty_max_penalty: float = 8.0,
+        entropy_penalty_min_repetitions: int = 1,
         ignore_eos: bool = False,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
@@ -284,6 +322,12 @@ class SglFunction:
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            entropy_penalty=entropy_penalty,
+            entropy_penalty_min_len=entropy_penalty_min_len,
+            entropy_penalty_max_len=entropy_penalty_max_len,
+            entropy_penalty_window=entropy_penalty_window,
+            entropy_penalty_max_penalty=entropy_penalty_max_penalty,
+            entropy_penalty_min_repetitions=entropy_penalty_min_repetitions,
             ignore_eos=ignore_eos,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -464,6 +508,12 @@ class SglGen(SglExpr):
         min_p: Optional[float] = None,
         frequency_penalty: Optional[float] = None,
         presence_penalty: Optional[float] = None,
+        entropy_penalty: Optional[float] = None,
+        entropy_penalty_min_len: Optional[int] = None,
+        entropy_penalty_max_len: Optional[int] = None,
+        entropy_penalty_window: Optional[int] = None,
+        entropy_penalty_max_penalty: Optional[float] = None,
+        entropy_penalty_min_repetitions: Optional[int] = None,
         ignore_eos: Optional[bool] = None,
         return_logprob: Optional[bool] = None,
         logprob_start_len: Optional[int] = None,
@@ -489,6 +539,12 @@ class SglGen(SglExpr):
             min_p=min_p,
             frequency_penalty=frequency_penalty,
             presence_penalty=presence_penalty,
+            entropy_penalty=entropy_penalty,
+            entropy_penalty_min_len=entropy_penalty_min_len,
+            entropy_penalty_max_len=entropy_penalty_max_len,
+            entropy_penalty_window=entropy_penalty_window,
+            entropy_penalty_max_penalty=entropy_penalty_max_penalty,
+            entropy_penalty_min_repetitions=entropy_penalty_min_repetitions,
             ignore_eos=ignore_eos,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
@@ -531,7 +587,6 @@ class SglRoleEnd(SglExpr):
 
 
 class SglSelect(SglExpr):
-
     def __init__(
         self,
         name: str,

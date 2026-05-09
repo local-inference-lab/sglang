@@ -415,6 +415,7 @@ class NgramVerifyInput(SpecInput):
         if (
             sampling_info.penalizer_orchestrator.is_required
             or sampling_info.logit_bias is not None
+            or sampling_info.has_thinking_end_logit_boost
         ):
             # This is a relaxed version of penalties for speculative decoding.
             sampling_info.penalizer_orchestrator.apply(
@@ -426,6 +427,9 @@ class NgramVerifyInput(SpecInput):
                         sampling_info.logit_bias, self.draft_token_num, dim=0
                     )
                 )
+            sampling_info.apply_thinking_end_logit_boost(
+                logits_output.next_token_logits, repeat=self.draft_token_num
+            )
 
         # Apply grammar mask
         if vocab_mask is not None:

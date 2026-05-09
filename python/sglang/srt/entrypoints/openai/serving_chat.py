@@ -392,6 +392,9 @@ class OpenAIServingChat(OpenAIServingBase):
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
+            preferred_sampling_params=(
+                self.tokenizer_manager.server_args.preferred_sampling_params
+            ),
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
@@ -423,6 +426,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            preferred_sampling_params_applied=True,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
@@ -663,7 +667,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **extra_template_kwargs,
                 )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
                 tools = (

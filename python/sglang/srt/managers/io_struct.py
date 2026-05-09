@@ -154,6 +154,9 @@ class GenerateReqInput(BaseReq):
     use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
+    # Whether server preferred sampling params have already been applied by the
+    # caller. This is used by OpenAI chat to preserve request-param priority.
+    preferred_sampling_params_applied: bool = False
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.

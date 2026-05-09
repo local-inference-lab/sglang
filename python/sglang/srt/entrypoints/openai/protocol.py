@@ -61,6 +61,31 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_NAME = "default"
 
 
+def _explicit_request_value(request: BaseModel, param_name: str):
+    if param_name in request.model_fields_set:
+        return getattr(request, param_name)
+    return None
+
+
+def _explicit_or_generation_default(
+    request: BaseModel, param_name: str, model_generation_config: Dict[str, Any]
+):
+    if param_name in request.model_fields_set:
+        return getattr(request, param_name)
+    return model_generation_config.get(param_name)
+
+
+def _request_or_generation_or_default(
+    request: BaseModel,
+    param_name: str,
+    model_generation_config: Dict[str, Any],
+    default: Any,
+):
+    if param_name in request.model_fields_set:
+        return getattr(request, param_name)
+    return model_generation_config.get(param_name, default)
+
+
 class ModelCard(BaseModel):
     """Model cards."""
 
@@ -295,6 +320,17 @@ class CompletionRequest(BaseModel):
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
+    entropy_penalty: float = 0.0
+    entropy_penalty_min_len: int = 16
+    entropy_penalty_max_len: int = 256
+    entropy_penalty_window: int = 8192
+    entropy_penalty_max_penalty: float = 8.0
+    entropy_penalty_min_repetitions: int = 1
+    thinking_end_logit_boost: float = 0.0
+    thinking_end_logit_boost_start: int = 0
+    thinking_end_logit_boost_ramp: int = 256
+    thinking_start_token_id: Optional[int] = None
+    thinking_end_token_id: Optional[int] = None
     stop_token_ids: Optional[List[int]] = None
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
@@ -658,6 +694,17 @@ class ChatCompletionRequest(BaseModel):
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
+    entropy_penalty: Optional[float] = None
+    entropy_penalty_min_len: Optional[int] = None
+    entropy_penalty_max_len: Optional[int] = None
+    entropy_penalty_window: Optional[int] = None
+    entropy_penalty_max_penalty: Optional[float] = None
+    entropy_penalty_min_repetitions: Optional[int] = None
+    thinking_end_logit_boost: Optional[float] = None
+    thinking_end_logit_boost_start: Optional[int] = None
+    thinking_end_logit_boost_ramp: Optional[int] = None
+    thinking_start_token_id: Optional[int] = None
+    thinking_end_token_id: Optional[int] = None
     stop_token_ids: Optional[List[int]] = None
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
@@ -707,6 +754,12 @@ class ChatCompletionRequest(BaseModel):
         "top_k": -1,
         "min_p": 0.0,
         "repetition_penalty": 1.0,
+        "entropy_penalty": 0.0,
+        "entropy_penalty_min_len": 16,
+        "entropy_penalty_max_len": 256,
+        "entropy_penalty_window": 8192,
+        "entropy_penalty_max_penalty": 8.0,
+        "entropy_penalty_min_repetitions": 1,
     }
 
     @model_validator(mode="before")
@@ -801,50 +854,113 @@ class ChatCompletionRequest(BaseModel):
         self,
         stop: List[str],
         model_generation_config: Dict[str, Any],
+        preferred_sampling_params: Optional[Dict[str, Any]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
-        Priority: user value > model generation_config > OpenAI defaults
+        Priority: request params > preferred sampling params > model
+        generation_config > OpenAI/SGLang defaults.
         """
+        generation_defaults = model_generation_config or {}
+        preferred_defaults = preferred_sampling_params or {}
 
-        def get_param(param_name: str):
-            value = getattr(self, param_name)
-            if value is None:
-                return model_generation_config.get(
-                    param_name, self._DEFAULT_SAMPLING_PARAMS[param_name]
-                )
-            return value
+        def get_default_param(param_names: Union[str, Tuple[str, ...]], default: Any):
+            if isinstance(param_names, str):
+                param_names = (param_names,)
+            for defaults in (preferred_defaults, generation_defaults):
+                for param_name in param_names:
+                    if param_name in defaults:
+                        return defaults[param_name]
+            return default
 
-        # add per user request
-        spaces_between_special_tokens = (
-            True
-            if self.chat_template_kwargs is None
-            else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
+        def get_param(
+            param_name: str,
+            default: Any = None,
+            request_param_name: Optional[str] = None,
+            default_param_names: Optional[Tuple[str, ...]] = None,
+        ):
+            request_param_name = request_param_name or param_name
+            request_value = getattr(self, request_param_name)
+            field = type(self).model_fields.get(request_param_name)
+            field_default = field.default if field is not None else None
+            if (
+                request_param_name in self.model_fields_set
+                or request_value != field_default
+            ):
+                return request_value
+            return get_default_param(default_param_names or param_name, default)
+
+        def get_max_new_tokens():
+            if "max_completion_tokens" in self.model_fields_set:
+                return self.max_completion_tokens
+            if "max_tokens" in self.model_fields_set:
+                return self.max_tokens
+            return get_default_param(("max_new_tokens", "max_tokens"), None)
+
+        def get_stop():
+            if "stop" in self.model_fields_set:
+                return stop
+            return get_default_param("stop", stop)
+
+        min_new_tokens = get_default_param(("min_new_tokens", "min_tokens"), 0)
+        if "min_tokens" in self.model_fields_set:
+            min_new_tokens = self.min_tokens
+
+        spaces_between_special_tokens = get_default_param(
+            "spaces_between_special_tokens", True
         )
+        if self.chat_template_kwargs is not None:
+            spaces_between_special_tokens = self.chat_template_kwargs.get(
+                "spaces_between_special_tokens", spaces_between_special_tokens
+            )
 
         sampling_params = {
-            "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
-            "min_new_tokens": self.min_tokens,
-            "stop": stop,
-            "stop_token_ids": self.stop_token_ids,
-            "stop_regex": self.stop_regex,
-            "top_p": get_param("top_p"),
-            "top_k": get_param("top_k"),
-            "min_p": get_param("min_p"),
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
-            "repetition_penalty": get_param("repetition_penalty"),
-            "regex": self.regex,
-            "ebnf": self.ebnf,
-            "n": self.n,
-            "no_stop_trim": self.no_stop_trim,
-            "ignore_eos": self.ignore_eos,
-            "skip_special_tokens": self.skip_special_tokens,
-            "logit_bias": self.logit_bias,
-            "custom_params": self.custom_params,
-            "sampling_seed": self.seed,
+            "temperature": get_param("temperature", 1.0),
+            "max_new_tokens": get_max_new_tokens(),
+            "min_new_tokens": min_new_tokens,
+            "stop": get_stop(),
+            "stop_token_ids": get_param("stop_token_ids"),
+            "stop_regex": get_param("stop_regex"),
+            "top_p": get_param("top_p", 1.0),
+            "top_k": get_param("top_k", -1),
+            "min_p": get_param("min_p", 0.0),
+            "presence_penalty": get_param("presence_penalty", 0.0),
+            "frequency_penalty": get_param("frequency_penalty", 0.0),
+            "repetition_penalty": get_param("repetition_penalty", 1.0),
+            "entropy_penalty": get_param("entropy_penalty", 0.0),
+            "entropy_penalty_min_len": get_param("entropy_penalty_min_len", 16),
+            "entropy_penalty_max_len": get_param("entropy_penalty_max_len", 256),
+            "entropy_penalty_window": get_param("entropy_penalty_window", 8192),
+            "entropy_penalty_max_penalty": get_param(
+                "entropy_penalty_max_penalty", 8.0
+            ),
+            "entropy_penalty_min_repetitions": get_param(
+                "entropy_penalty_min_repetitions", 1
+            ),
+            "thinking_end_logit_boost": get_param("thinking_end_logit_boost", 0.0),
+            "thinking_end_logit_boost_start": get_param(
+                "thinking_end_logit_boost_start", 0
+            ),
+            "thinking_end_logit_boost_ramp": get_param(
+                "thinking_end_logit_boost_ramp", 256
+            ),
+            "thinking_start_token_id": get_param("thinking_start_token_id"),
+            "thinking_end_token_id": get_param("thinking_end_token_id"),
+            "regex": get_param("regex"),
+            "ebnf": get_param("ebnf"),
+            "n": get_param("n", 1),
+            "no_stop_trim": get_param("no_stop_trim", False),
+            "ignore_eos": get_param("ignore_eos", False),
+            "skip_special_tokens": get_param("skip_special_tokens", True),
+            "logit_bias": get_param("logit_bias"),
+            "custom_params": get_param("custom_params"),
+            "sampling_seed": get_param(
+                "sampling_seed",
+                None,
+                request_param_name="seed",
+                default_param_names=("sampling_seed", "seed"),
+            ),
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
@@ -1301,6 +1417,17 @@ class ResponsesRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.0
+    entropy_penalty: float = 0.0
+    entropy_penalty_min_len: int = 16
+    entropy_penalty_max_len: int = 256
+    entropy_penalty_window: int = 8192
+    entropy_penalty_max_penalty: float = 8.0
+    entropy_penalty_min_repetitions: int = 1
+    thinking_end_logit_boost: float = 0.0
+    thinking_end_logit_boost_start: int = 0
+    thinking_end_logit_boost_ramp: int = 256
+    thinking_start_token_id: Optional[int] = None
+    thinking_end_token_id: Optional[int] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1309,6 +1436,12 @@ class ResponsesRequest(BaseModel):
         "top_k": -1,
         "min_p": 0.0,
         "repetition_penalty": 1.0,
+        "entropy_penalty": 0.0,
+        "entropy_penalty_min_len": 16,
+        "entropy_penalty_max_len": 256,
+        "entropy_penalty_window": 8192,
+        "entropy_penalty_max_penalty": 8.0,
+        "entropy_penalty_min_repetitions": 1,
     }
 
     def to_sampling_params(
@@ -1328,15 +1461,15 @@ class ResponsesRequest(BaseModel):
         max_tokens -= 2
 
         # Get parameters with defaults
-        temperature = self.temperature
-        if temperature is None:
-            temperature = default_params.get(
-                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
-            )
-
-        top_p = self.top_p
-        if top_p is None:
-            top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
+        temperature = _request_or_generation_or_default(
+            self,
+            "temperature",
+            default_params,
+            self._DEFAULT_SAMPLING_PARAMS["temperature"],
+        )
+        top_p = _request_or_generation_or_default(
+            self, "top_p", default_params, self._DEFAULT_SAMPLING_PARAMS["top_p"]
+        )
 
         params = {
             "max_new_tokens": max_tokens,
@@ -1345,9 +1478,51 @@ class ResponsesRequest(BaseModel):
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
             "stop": self.stop,
-            "top_k": self.top_k,
-            "min_p": self.min_p,
-            "repetition_penalty": self.repetition_penalty,
+            "top_k": _request_or_generation_or_default(
+                self, "top_k", default_params, self._DEFAULT_SAMPLING_PARAMS["top_k"]
+            ),
+            "min_p": _request_or_generation_or_default(
+                self, "min_p", default_params, self._DEFAULT_SAMPLING_PARAMS["min_p"]
+            ),
+            "repetition_penalty": _request_or_generation_or_default(
+                self,
+                "repetition_penalty",
+                default_params,
+                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
+            ),
+            "entropy_penalty": _explicit_or_generation_default(
+                self, "entropy_penalty", default_params
+            ),
+            "entropy_penalty_min_len": _explicit_or_generation_default(
+                self, "entropy_penalty_min_len", default_params
+            ),
+            "entropy_penalty_max_len": _explicit_or_generation_default(
+                self, "entropy_penalty_max_len", default_params
+            ),
+            "entropy_penalty_window": _explicit_or_generation_default(
+                self, "entropy_penalty_window", default_params
+            ),
+            "entropy_penalty_max_penalty": _explicit_or_generation_default(
+                self, "entropy_penalty_max_penalty", default_params
+            ),
+            "entropy_penalty_min_repetitions": _explicit_or_generation_default(
+                self, "entropy_penalty_min_repetitions", default_params
+            ),
+            "thinking_end_logit_boost": _explicit_or_generation_default(
+                self, "thinking_end_logit_boost", default_params
+            ),
+            "thinking_end_logit_boost_start": _explicit_or_generation_default(
+                self, "thinking_end_logit_boost_start", default_params
+            ),
+            "thinking_end_logit_boost_ramp": _explicit_or_generation_default(
+                self, "thinking_end_logit_boost_ramp", default_params
+            ),
+            "thinking_start_token_id": _explicit_or_generation_default(
+                self, "thinking_start_token_id", default_params
+            ),
+            "thinking_end_token_id": _explicit_or_generation_default(
+                self, "thinking_end_token_id", default_params
+            ),
         }
 
         # Apply any additional default parameters

@@ -130,6 +130,47 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_ids_logprobs",
 )
 
+_PREFERRED_SAMPLING_PARAMS_OMIT_NONE_KEYS = {
+    "entropy_penalty",
+    "entropy_penalty_min_len",
+    "entropy_penalty_max_len",
+    "entropy_penalty_window",
+    "entropy_penalty_max_penalty",
+    "entropy_penalty_min_repetitions",
+    "thinking_end_logit_boost",
+    "thinking_end_logit_boost_start",
+    "thinking_end_logit_boost_ramp",
+    "thinking_start_token_id",
+    "thinking_end_token_id",
+}
+
+
+def merge_preferred_sampling_params(
+    preferred_sampling_params: Optional[Dict[str, Any]],
+    sampling_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Apply narrow server-side defaults without changing normal None semantics."""
+    if not preferred_sampling_params:
+        return sampling_params
+
+    explicit_sampling_params = {}
+    for key, value in sampling_params.items():
+        if value is None and key in _PREFERRED_SAMPLING_PARAMS_OMIT_NONE_KEYS:
+            continue
+        if key == "logit_bias" and value is None:
+            continue
+        explicit_sampling_params[key] = value
+
+    merged = {**preferred_sampling_params, **explicit_sampling_params}
+    preferred_logit_bias = preferred_sampling_params.get("logit_bias")
+    request_logit_bias = sampling_params.get("logit_bias")
+    if preferred_logit_bias is not None:
+        if request_logit_bias is not None:
+            merged["logit_bias"] = {**request_logit_bias, **preferred_logit_bias}
+        else:
+            merged["logit_bias"] = preferred_logit_bias
+    return merged
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -225,6 +266,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
         self.preferred_sampling_params = server_args.preferred_sampling_params
+        self.server_args.preferred_sampling_params = self.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         set_global_server_args_for_tokenizer(server_args)
 
@@ -967,12 +1009,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
-        # Note: if there are preferred sampling params, we use them if they are not
-        # explicitly passed in sampling_params
-        if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
-        else:
+        # Some entrypoints apply preferred sampling params before building the
+        # internal request so request-param precedence is preserved.
+        if getattr(obj, "preferred_sampling_params_applied", False):
             sampling_kwargs = obj.sampling_params
+        else:
+            sampling_kwargs = merge_preferred_sampling_params(
+                self.preferred_sampling_params, obj.sampling_params
+            )
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)

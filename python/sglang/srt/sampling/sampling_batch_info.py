@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_THINKING_END_LOGIT_BOOST_LOG_INITIAL_APPLICATIONS = 8
+_THINKING_END_LOGIT_BOOST_LOG_APPLICATION_INTERVAL = 128
+
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
@@ -70,6 +73,16 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Slowly bias an open thinking block toward its end token.
+    has_thinking_end_logit_boost: bool = False
+    thinking_start_token_ids: Optional[List[Optional[int]]] = None
+    thinking_end_token_ids: Optional[List[Optional[int]]] = None
+    thinking_end_logit_boosts: Optional[List[float]] = None
+    thinking_end_logit_boost_start_tokens: Optional[List[int]] = None
+    thinking_end_logit_boost_ramp_tokens: Optional[List[int]] = None
+    thinking_end_logit_boost_reqs: Optional[List[Any]] = None
+    thinking_end_logit_boost_logged_applications: Optional[List[int]] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -116,6 +129,36 @@ class SamplingBatchInfo:
                     for key, value in r.sampling_params.logit_bias.items():
                         logit_bias[i, int(key)] = value
 
+        thinking_end_logit_boosts = [
+            float(r.sampling_params.thinking_end_logit_boost) for r in reqs
+        ]
+        has_thinking_end_logit_boost = any(
+            boost > 0.0 for boost in thinking_end_logit_boosts
+        )
+        if has_thinking_end_logit_boost:
+            thinking_start_token_ids = [
+                r.sampling_params.thinking_start_token_id for r in reqs
+            ]
+            thinking_end_token_ids = [
+                r.sampling_params.thinking_end_token_id for r in reqs
+            ]
+            thinking_end_logit_boost_start_tokens = [
+                int(r.sampling_params.thinking_end_logit_boost_start) for r in reqs
+            ]
+            thinking_end_logit_boost_ramp_tokens = [
+                int(r.sampling_params.thinking_end_logit_boost_ramp) for r in reqs
+            ]
+            thinking_end_logit_boost_reqs = list(reqs)
+            thinking_end_logit_boost_logged_applications = [0] * len(reqs)
+        else:
+            thinking_start_token_ids = None
+            thinking_end_token_ids = None
+            thinking_end_logit_boosts = None
+            thinking_end_logit_boost_start_tokens = None
+            thinking_end_logit_boost_ramp_tokens = None
+            thinking_end_logit_boost_reqs = None
+            thinking_end_logit_boost_logged_applications = None
+
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
             global_server_args.enable_custom_logit_processor
@@ -160,6 +203,7 @@ class SamplingBatchInfo:
             vocab_size=vocab_size,
             batch=batch,
             penalizers={
+                penaltylib.BatchedEntropyPenalizer,
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
                 penaltylib.BatchedPresencePenalizer,
@@ -184,6 +228,16 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            has_thinking_end_logit_boost=has_thinking_end_logit_boost,
+            thinking_start_token_ids=thinking_start_token_ids,
+            thinking_end_token_ids=thinking_end_token_ids,
+            thinking_end_logit_boosts=thinking_end_logit_boosts,
+            thinking_end_logit_boost_start_tokens=thinking_end_logit_boost_start_tokens,
+            thinking_end_logit_boost_ramp_tokens=thinking_end_logit_boost_ramp_tokens,
+            thinking_end_logit_boost_reqs=thinking_end_logit_boost_reqs,
+            thinking_end_logit_boost_logged_applications=(
+                thinking_end_logit_boost_logged_applications
+            ),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -268,11 +322,127 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             logits.add_(self.logit_bias)
 
+        if self.has_thinking_end_logit_boost:
+            self.apply_thinking_end_logit_boost(logits)
+
+    def apply_thinking_end_logit_boost(
+        self, logits: torch.Tensor, repeat: int = 1
+    ) -> None:
+        if not self.has_thinking_end_logit_boost:
+            return
+
+        if repeat < 1:
+            raise ValueError(f"repeat must be at least 1, got {repeat}.")
+        assert logits.shape[0] == len(self) * repeat, (
+            f"The batch size of logits ({logits.shape[0]}) does not match the batch "
+            f"size of sampling info ({len(self)}) x repeat ({repeat})."
+        )
+
+        row_indices: List[int] = []
+        token_ids: List[int] = []
+        boost_values: List[float] = []
+
+        assert self.thinking_end_logit_boost_reqs is not None
+        assert self.thinking_end_logit_boosts is not None
+        assert self.thinking_start_token_ids is not None
+        assert self.thinking_end_token_ids is not None
+        assert self.thinking_end_logit_boost_start_tokens is not None
+        assert self.thinking_end_logit_boost_ramp_tokens is not None
+        if self.thinking_end_logit_boost_logged_applications is None:
+            self.thinking_end_logit_boost_logged_applications = [0] * len(self)
+
+        for i, req in enumerate(self.thinking_end_logit_boost_reqs):
+            boost = self.thinking_end_logit_boosts[i]
+            if boost <= 0.0 or req is None:
+                continue
+
+            start_token_id = self.thinking_start_token_ids[i]
+            end_token_id = self.thinking_end_token_ids[i]
+            if start_token_id is None or end_token_id is None:
+                continue
+
+            cur_ids = [*req.origin_input_ids, *req.output_ids]
+            start_index = self._last_token_index(cur_ids, start_token_id)
+            if start_index is None:
+                continue
+
+            end_index = self._last_token_index(cur_ids, end_token_id)
+            if end_index is not None and end_index > start_index:
+                continue
+
+            depth = len(cur_ids) - start_index - 1
+            depth_after_cutin = depth - self.thinking_end_logit_boost_start_tokens[i]
+            if depth_after_cutin < 0:
+                continue
+
+            ramp_tokens = self.thinking_end_logit_boost_ramp_tokens[i]
+            ramp_fraction = (
+                1.0 if ramp_tokens == 0 else min(depth_after_cutin / ramp_tokens, 1.0)
+            )
+            boost_value = boost * ramp_fraction
+            if boost_value == 0.0 or not 0 <= end_token_id < logits.shape[-1]:
+                continue
+
+            self.thinking_end_logit_boost_logged_applications[i] += 1
+            application_count = self.thinking_end_logit_boost_logged_applications[i]
+            if (
+                application_count
+                <= _THINKING_END_LOGIT_BOOST_LOG_INITIAL_APPLICATIONS
+                or application_count
+                % _THINKING_END_LOGIT_BOOST_LOG_APPLICATION_INTERVAL
+                == 0
+            ):
+                logger.info(
+                    "thinking_end_logit_boost applied request_id=%s depth=%d "
+                    "end_token=%d boost=%.3f max_boost=%.3f ramp_fraction=%.3f "
+                    "cutin=%d ramp=%d repeat=%d application_count=%d",
+                    getattr(req, "rid", None),
+                    depth,
+                    end_token_id,
+                    boost_value,
+                    boost,
+                    ramp_fraction,
+                    self.thinking_end_logit_boost_start_tokens[i],
+                    ramp_tokens,
+                    repeat,
+                    application_count,
+                )
+
+            row_indices.append(i)
+            token_ids.append(end_token_id)
+            boost_values.append(boost_value)
+
+        if not row_indices:
+            return
+
+        rows = torch.tensor(row_indices, device=logits.device, dtype=torch.long)
+        cols = torch.tensor(token_ids, device=logits.device, dtype=torch.long)
+        values = torch.tensor(boost_values, device=logits.device, dtype=logits.dtype)
+        if repeat != 1:
+            offsets = torch.arange(repeat, device=logits.device, dtype=torch.long)
+            rows = (rows * repeat).repeat_interleave(repeat) + offsets.repeat(
+                len(row_indices)
+            )
+            cols = cols.repeat_interleave(repeat)
+            values = values.repeat_interleave(repeat)
+
+        logits[rows, cols] += values
+
+    @staticmethod
+    def _last_token_index(token_ids: List[int], token_id: int) -> Optional[int]:
+        for i in range(len(token_ids) - 1, -1, -1):
+            if token_ids[i] == token_id:
+                return i
+        return None
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+
+        if self.has_thinking_end_logit_boost:
+            self._filter_batch_thinking_end_logit_boost(keep_indices)
 
         for item in [
             "temperatures",
@@ -309,6 +479,23 @@ class SamplingBatchInfo:
             self.custom_logit_processor = None
             self.custom_params = None
             self.has_custom_logit_processor = False
+
+    def _filter_batch_thinking_end_logit_boost(self, keep_indices: List[int]):
+        for item in [
+            "thinking_start_token_ids",
+            "thinking_end_token_ids",
+            "thinking_end_logit_boosts",
+            "thinking_end_logit_boost_start_tokens",
+            "thinking_end_logit_boost_ramp_tokens",
+            "thinking_end_logit_boost_reqs",
+            "thinking_end_logit_boost_logged_applications",
+        ]:
+            values = getattr(self, item)
+            if values is None and item == "thinking_end_logit_boost_logged_applications":
+                values = [0] * len(self)
+            setattr(self, item, [values[i] for i in keep_indices])
+
+        self._cleanup_thinking_end_logit_boost()
 
     @staticmethod
     def merge_custom_logit_processor(
@@ -379,6 +566,9 @@ class SamplingBatchInfo:
             self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
         )
 
+        if self.has_thinking_end_logit_boost or other.has_thinking_end_logit_boost:
+            self._merge_thinking_end_logit_boost(other)
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -400,6 +590,67 @@ class SamplingBatchInfo:
         self.need_min_p_sampling |= other.need_min_p_sampling
 
         self.adjusted_merge_batch(other)
+
+    def _merge_thinking_end_logit_boost(self, other: "SamplingBatchInfo"):
+        self._ensure_thinking_end_logit_boost_lists()
+        other_values = other._thinking_end_logit_boost_lists_or_defaults()
+        for item, values in other_values.items():
+            getattr(self, item).extend(values)
+        self.has_thinking_end_logit_boost = True
+
+    def _ensure_thinking_end_logit_boost_lists(self):
+        if self.has_thinking_end_logit_boost:
+            return
+        self.thinking_start_token_ids = [None] * len(self)
+        self.thinking_end_token_ids = [None] * len(self)
+        self.thinking_end_logit_boosts = [0.0] * len(self)
+        self.thinking_end_logit_boost_start_tokens = [0] * len(self)
+        self.thinking_end_logit_boost_ramp_tokens = [0] * len(self)
+        self.thinking_end_logit_boost_reqs = [None] * len(self)
+        self.thinking_end_logit_boost_logged_applications = [0] * len(self)
+        self.has_thinking_end_logit_boost = True
+
+    def _thinking_end_logit_boost_lists_or_defaults(self) -> Dict[str, List[Any]]:
+        if self.has_thinking_end_logit_boost:
+            return {
+                "thinking_start_token_ids": list(self.thinking_start_token_ids),
+                "thinking_end_token_ids": list(self.thinking_end_token_ids),
+                "thinking_end_logit_boosts": list(self.thinking_end_logit_boosts),
+                "thinking_end_logit_boost_start_tokens": list(
+                    self.thinking_end_logit_boost_start_tokens
+                ),
+                "thinking_end_logit_boost_ramp_tokens": list(
+                    self.thinking_end_logit_boost_ramp_tokens
+                ),
+                "thinking_end_logit_boost_reqs": list(
+                    self.thinking_end_logit_boost_reqs
+                ),
+                "thinking_end_logit_boost_logged_applications": list(
+                    self.thinking_end_logit_boost_logged_applications
+                    or [0] * len(self)
+                ),
+            }
+        return {
+            "thinking_start_token_ids": [None] * len(self),
+            "thinking_end_token_ids": [None] * len(self),
+            "thinking_end_logit_boosts": [0.0] * len(self),
+            "thinking_end_logit_boost_start_tokens": [0] * len(self),
+            "thinking_end_logit_boost_ramp_tokens": [0] * len(self),
+            "thinking_end_logit_boost_reqs": [None] * len(self),
+            "thinking_end_logit_boost_logged_applications": [0] * len(self),
+        }
+
+    def _cleanup_thinking_end_logit_boost(self):
+        if any(boost > 0.0 for boost in self.thinking_end_logit_boosts):
+            return
+        self.has_thinking_end_logit_boost = False
+        self.thinking_start_token_ids = None
+        self.thinking_end_token_ids = None
+        self.thinking_end_logit_boosts = None
+        self.thinking_end_logit_boost_start_tokens = None
+        self.thinking_end_logit_boost_ramp_tokens = None
+        self.thinking_end_logit_boost_reqs = None
+        self.thinking_end_logit_boost_logged_applications = None
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later

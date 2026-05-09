@@ -624,9 +624,9 @@ class StreamExecutor:
             self.meta_info[name] = meta_info
             self.variable_event[name].set()
         else:
-            assert (
-                self.num_api_spec_tokens is None
-            ), "stream is not supported with api speculative execution"
+            assert self.num_api_spec_tokens is None, (
+                "stream is not supported with api speculative execution"
+            )
             generator = self.backend.generate_stream(
                 self, sampling_params=sampling_params
             )
@@ -823,6 +823,12 @@ class StreamExecutor:
             "min_p",
             "frequency_penalty",
             "presence_penalty",
+            "entropy_penalty",
+            "entropy_penalty_min_len",
+            "entropy_penalty_max_len",
+            "entropy_penalty_window",
+            "entropy_penalty_max_penalty",
+            "entropy_penalty_min_repetitions",
             "ignore_eos",
             "return_logprob",
             "logprob_start_len",

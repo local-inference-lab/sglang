@@ -50,6 +50,17 @@ class SamplingParams:
         frequency_penalty: float = 0.0,
         presence_penalty: float = 0.0,
         repetition_penalty: float = 1.0,
+        entropy_penalty: float = 0.0,
+        entropy_penalty_min_len: int = 16,
+        entropy_penalty_max_len: int = 256,
+        entropy_penalty_window: int = 8192,
+        entropy_penalty_max_penalty: float = 8.0,
+        entropy_penalty_min_repetitions: int = 1,
+        thinking_end_logit_boost: float = 0.0,
+        thinking_end_logit_boost_start: int = 0,
+        thinking_end_logit_boost_ramp: int = 256,
+        thinking_start_token_id: Optional[int] = None,
+        thinking_end_token_id: Optional[int] = None,
         min_new_tokens: int = 0,
         n: int = 1,
         json_schema: Optional[str] = None,
@@ -87,6 +98,51 @@ class SamplingParams:
         )
         self.repetition_penalty = (
             repetition_penalty if repetition_penalty is not None else 1.0
+        )
+        self.entropy_penalty = entropy_penalty if entropy_penalty is not None else 0.0
+        self.entropy_penalty_min_len = (
+            entropy_penalty_min_len if entropy_penalty_min_len is not None else 16
+        )
+        self.entropy_penalty_max_len = (
+            entropy_penalty_max_len if entropy_penalty_max_len is not None else 256
+        )
+        self.entropy_penalty_window = (
+            entropy_penalty_window if entropy_penalty_window is not None else 8192
+        )
+        self.entropy_penalty_max_penalty = (
+            entropy_penalty_max_penalty
+            if entropy_penalty_max_penalty is not None
+            else 8.0
+        )
+        self.entropy_penalty_min_repetitions = (
+            int(entropy_penalty_min_repetitions)
+            if entropy_penalty_min_repetitions is not None
+            else 1
+        )
+        self.thinking_end_logit_boost = (
+            float(thinking_end_logit_boost)
+            if thinking_end_logit_boost is not None
+            else 0.0
+        )
+        self.thinking_end_logit_boost_start = (
+            int(thinking_end_logit_boost_start)
+            if thinking_end_logit_boost_start is not None
+            else 0
+        )
+        self.thinking_end_logit_boost_ramp = (
+            int(thinking_end_logit_boost_ramp)
+            if thinking_end_logit_boost_ramp is not None
+            else 256
+        )
+        self.thinking_start_token_id = (
+            int(thinking_start_token_id)
+            if thinking_start_token_id is not None
+            else None
+        )
+        self.thinking_end_token_id = (
+            int(thinking_end_token_id)
+            if thinking_end_token_id is not None
+            else None
         )
         self.min_new_tokens = min_new_tokens if min_new_tokens is not None else 0
         self.regex = regex
@@ -132,18 +188,82 @@ class SamplingParams:
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got "
-                f"{self.frequency_penalty}."
+                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
-                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
         if not 0.0 <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in [0, 2], got "
-                f"{self.repetition_penalty}."
+                f"repetition_penalty must be in [0, 2], got {self.repetition_penalty}."
             )
+        if self.entropy_penalty < 0.0:
+            raise ValueError(
+                f"entropy_penalty must be non-negative, got {self.entropy_penalty}."
+            )
+        if self.entropy_penalty_min_len < 1:
+            raise ValueError(
+                "entropy_penalty_min_len must be at least 1, got "
+                f"{self.entropy_penalty_min_len}."
+            )
+        if self.entropy_penalty_max_len < self.entropy_penalty_min_len:
+            raise ValueError(
+                "entropy_penalty_max_len must be at least "
+                f"entropy_penalty_min_len({self.entropy_penalty_min_len}), got "
+                f"{self.entropy_penalty_max_len}."
+            )
+        if self.entropy_penalty_window < self.entropy_penalty_max_len:
+            raise ValueError(
+                "entropy_penalty_window must be at least "
+                f"entropy_penalty_max_len({self.entropy_penalty_max_len}), got "
+                f"{self.entropy_penalty_window}."
+            )
+        if self.entropy_penalty_max_penalty < 0.0:
+            raise ValueError(
+                "entropy_penalty_max_penalty must be non-negative, got "
+                f"{self.entropy_penalty_max_penalty}."
+            )
+        if self.entropy_penalty_min_repetitions < 1:
+            raise ValueError(
+                "entropy_penalty_min_repetitions must be at least 1, got "
+                f"{self.entropy_penalty_min_repetitions}."
+            )
+        if self.thinking_end_logit_boost < 0.0:
+            raise ValueError(
+                "thinking_end_logit_boost must be non-negative, got "
+                f"{self.thinking_end_logit_boost}."
+            )
+        if self.thinking_end_logit_boost_start < 0:
+            raise ValueError(
+                "thinking_end_logit_boost_start must be non-negative, got "
+                f"{self.thinking_end_logit_boost_start}."
+            )
+        if self.thinking_end_logit_boost_ramp < 0:
+            raise ValueError(
+                "thinking_end_logit_boost_ramp must be non-negative, got "
+                f"{self.thinking_end_logit_boost_ramp}."
+            )
+        for name in ("thinking_start_token_id", "thinking_end_token_id"):
+            token_id = getattr(self, name)
+            if token_id is not None and not 0 <= token_id < vocab_size:
+                raise ValueError(
+                    f"{name} must be in [0, {vocab_size - 1}], got {token_id}."
+                )
+        if self.thinking_end_logit_boost > 0.0:
+            if (
+                self.thinking_start_token_id is None
+                or self.thinking_end_token_id is None
+            ):
+                raise ValueError(
+                    "thinking_end_logit_boost requires single-token <think> and "
+                    "</think> markers. Provide thinking_start_token_id and "
+                    "thinking_end_token_id if the tokenizer cannot infer them."
+                )
+            if self.thinking_start_token_id == self.thinking_end_token_id:
+                raise ValueError(
+                    "thinking_start_token_id and thinking_end_token_id must differ."
+                )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
                 f"min_new_tokens must be in [0, max_new_tokens], got "
@@ -176,6 +296,16 @@ class SamplingParams:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
 
     def normalize(self, tokenizer):
+        if self.thinking_end_logit_boost > 0.0 and tokenizer is not None:
+            if self.thinking_start_token_id is None:
+                self.thinking_start_token_id = self._encode_single_token_id(
+                    tokenizer, "<think>"
+                )
+            if self.thinking_end_token_id is None:
+                self.thinking_end_token_id = self._encode_single_token_id(
+                    tokenizer, "</think>"
+                )
+
         # Process stop strings
         if self.stop_strs is None:
             self.stop_strs = []
@@ -208,6 +338,17 @@ class SamplingParams:
                 )
 
             self.stop_regex_max_len = stop_regex_max_len
+
+    @staticmethod
+    def _encode_single_token_id(tokenizer, text: str) -> Optional[int]:
+        try:
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            token_ids = tokenizer.encode(text)
+        except Exception:
+            return None
+
+        return int(token_ids[0]) if len(token_ids) == 1 else None
 
 
 # This function gets a strict upperbound on the maximum number of tokens that would need

@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    ResponsesRequest,
     Tool,
     UsageInfo,
 )
@@ -92,6 +93,17 @@ class TestCompletionRequest(unittest.TestCase):
             repetition_penalty=1.1,
             regex=r"\d+",
             json_schema='{"type": "object"}',
+            entropy_penalty=1.5,
+            entropy_penalty_min_len=8,
+            entropy_penalty_max_len=64,
+            entropy_penalty_window=512,
+            entropy_penalty_max_penalty=4.0,
+            entropy_penalty_min_repetitions=3,
+            thinking_end_logit_boost=2.5,
+            thinking_end_logit_boost_start=32,
+            thinking_end_logit_boost_ramp=256,
+            thinking_start_token_id=11,
+            thinking_end_token_id=12,
             lora_path="/path/to/lora",
         )
         self.assertEqual(request.top_k, 50)
@@ -99,6 +111,17 @@ class TestCompletionRequest(unittest.TestCase):
         self.assertEqual(request.repetition_penalty, 1.1)
         self.assertEqual(request.regex, r"\d+")
         self.assertEqual(request.json_schema, '{"type": "object"}')
+        self.assertEqual(request.entropy_penalty, 1.5)
+        self.assertEqual(request.entropy_penalty_min_len, 8)
+        self.assertEqual(request.entropy_penalty_max_len, 64)
+        self.assertEqual(request.entropy_penalty_window, 512)
+        self.assertEqual(request.entropy_penalty_max_penalty, 4.0)
+        self.assertEqual(request.entropy_penalty_min_repetitions, 3)
+        self.assertEqual(request.thinking_end_logit_boost, 2.5)
+        self.assertEqual(request.thinking_end_logit_boost_start, 32)
+        self.assertEqual(request.thinking_end_logit_boost_ramp, 256)
+        self.assertEqual(request.thinking_start_token_id, 11)
+        self.assertEqual(request.thinking_end_token_id, 12)
         self.assertEqual(request.lora_path, "/path/to/lora")
 
     def test_completion_request_validation_errors(self):
@@ -133,6 +156,17 @@ class TestChatCompletionRequest(unittest.TestCase):
             max_tokens=150,
             min_tokens=5,
             top_p=0.9,
+            entropy_penalty=1.25,
+            entropy_penalty_min_len=12,
+            entropy_penalty_max_len=96,
+            entropy_penalty_window=1024,
+            entropy_penalty_max_penalty=6.0,
+            entropy_penalty_min_repetitions=4,
+            thinking_end_logit_boost=3.0,
+            thinking_end_logit_boost_start=24,
+            thinking_end_logit_boost_ramp=128,
+            thinking_start_token_id=21,
+            thinking_end_token_id=22,
             stop=["</s>"],
         )
         params = req.to_sampling_params(["</s>"], {}, None)
@@ -140,6 +174,130 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["max_new_tokens"], 150)
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
+        self.assertEqual(params["entropy_penalty"], 1.25)
+        self.assertEqual(params["entropy_penalty_min_len"], 12)
+        self.assertEqual(params["entropy_penalty_max_len"], 96)
+        self.assertEqual(params["entropy_penalty_window"], 1024)
+        self.assertEqual(params["entropy_penalty_max_penalty"], 6.0)
+        self.assertEqual(params["entropy_penalty_min_repetitions"], 4)
+        self.assertEqual(params["thinking_end_logit_boost"], 3.0)
+        self.assertEqual(params["thinking_end_logit_boost_start"], 24)
+        self.assertEqual(params["thinking_end_logit_boost_ramp"], 128)
+        self.assertEqual(params["thinking_start_token_id"], 21)
+        self.assertEqual(params["thinking_end_token_id"], 22)
+
+    def test_sampling_param_build_uses_entropy_model_defaults(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        params = req.to_sampling_params(
+            [],
+            {
+                "entropy_penalty": 0.75,
+                "entropy_penalty_min_len": 7,
+                "entropy_penalty_max_len": 63,
+                "entropy_penalty_window": 511,
+                "entropy_penalty_max_penalty": 3.5,
+                "entropy_penalty_min_repetitions": 5,
+                "thinking_end_logit_boost": 1.5,
+                "thinking_end_logit_boost_start": 9,
+                "thinking_end_logit_boost_ramp": 99,
+                "thinking_start_token_id": 31,
+                "thinking_end_token_id": 32,
+            },
+            None,
+        )
+        self.assertEqual(params["entropy_penalty"], 0.75)
+        self.assertEqual(params["entropy_penalty_min_len"], 7)
+        self.assertEqual(params["entropy_penalty_max_len"], 63)
+        self.assertEqual(params["entropy_penalty_window"], 511)
+        self.assertEqual(params["entropy_penalty_max_penalty"], 3.5)
+        self.assertEqual(params["entropy_penalty_min_repetitions"], 5)
+        self.assertEqual(params["thinking_end_logit_boost"], 1.5)
+        self.assertEqual(params["thinking_end_logit_boost_start"], 9)
+        self.assertEqual(params["thinking_end_logit_boost_ramp"], 99)
+        self.assertEqual(params["thinking_start_token_id"], 31)
+        self.assertEqual(params["thinking_end_token_id"], 32)
+
+    def test_sampling_param_build_uses_uniform_internal_defaults(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        params = req.to_sampling_params([], {}, None)
+        self.assertEqual(params["entropy_penalty"], 0.0)
+        self.assertEqual(params["entropy_penalty_min_len"], 16)
+        self.assertEqual(params["entropy_penalty_max_len"], 256)
+        self.assertEqual(params["entropy_penalty_window"], 8192)
+        self.assertEqual(params["entropy_penalty_max_penalty"], 8.0)
+        self.assertEqual(params["entropy_penalty_min_repetitions"], 1)
+        self.assertEqual(params["thinking_end_logit_boost"], 0.0)
+        self.assertEqual(params["thinking_end_logit_boost_start"], 0)
+        self.assertEqual(params["thinking_end_logit_boost_ramp"], 256)
+        self.assertIsNone(params["thinking_start_token_id"])
+        self.assertIsNone(params["thinking_end_token_id"])
+
+    def test_chat_preferred_sampling_params_override_generation_defaults(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=0.4,
+            top_p=0.5,
+            logit_bias={"7": 1.0},
+        )
+        params = req.to_sampling_params(
+            ["template-stop"],
+            {
+                "temperature": 0.9,
+                "top_p": 0.8,
+                "repetition_penalty": 1.1,
+                "presence_penalty": 0.1,
+                "logit_bias": {"7": -2.0},
+                "max_new_tokens": 100,
+                "min_new_tokens": 2,
+                "sampling_seed": 1,
+                "stop": ["generation-stop"],
+            },
+            {
+                "temperature": 0.7,
+                "top_p": 0.6,
+                "repetition_penalty": 1.2,
+                "presence_penalty": 0.2,
+                "logit_bias": {"7": -1.0},
+                "max_tokens": 50,
+                "min_tokens": 3,
+                "seed": 7,
+                "stop": ["preferred-stop"],
+            },
+            None,
+        )
+
+        self.assertEqual(params["temperature"], 0.4)
+        self.assertEqual(params["top_p"], 0.5)
+        self.assertEqual(params["repetition_penalty"], 1.2)
+        self.assertEqual(params["presence_penalty"], 0.2)
+        self.assertEqual(params["logit_bias"], {"7": 1.0})
+        self.assertEqual(params["max_new_tokens"], 50)
+        self.assertEqual(params["min_new_tokens"], 3)
+        self.assertEqual(params["sampling_seed"], 7)
+        self.assertEqual(params["stop"], ["preferred-stop"])
+
+    def test_chat_request_object_values_override_preferred_sampling_params(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        req.skip_special_tokens = False
+
+        params = req.to_sampling_params(
+            [],
+            {},
+            {"skip_special_tokens": True},
+            None,
+        )
+
+        self.assertFalse(params["skip_special_tokens"])
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""
@@ -169,15 +327,84 @@ class TestChatCompletionRequest(unittest.TestCase):
             messages=messages,
             top_k=40,
             min_p=0.05,
+            entropy_penalty=1.5,
+            entropy_penalty_min_len=8,
+            entropy_penalty_max_len=64,
+            entropy_penalty_window=512,
+            entropy_penalty_max_penalty=4.0,
+            entropy_penalty_min_repetitions=3,
+            thinking_end_logit_boost=2.0,
+            thinking_end_logit_boost_start=16,
+            thinking_end_logit_boost_ramp=96,
+            thinking_start_token_id=41,
+            thinking_end_token_id=42,
             separate_reasoning=False,
             stream_reasoning=False,
             chat_template_kwargs={"custom_param": "value"},
         )
         self.assertEqual(request.top_k, 40)
         self.assertEqual(request.min_p, 0.05)
+        self.assertEqual(request.entropy_penalty, 1.5)
+        self.assertEqual(request.entropy_penalty_min_len, 8)
+        self.assertEqual(request.entropy_penalty_max_len, 64)
+        self.assertEqual(request.entropy_penalty_window, 512)
+        self.assertEqual(request.entropy_penalty_max_penalty, 4.0)
+        self.assertEqual(request.entropy_penalty_min_repetitions, 3)
+        self.assertEqual(request.thinking_end_logit_boost, 2.0)
+        self.assertEqual(request.thinking_end_logit_boost_start, 16)
+        self.assertEqual(request.thinking_end_logit_boost_ramp, 96)
+        self.assertEqual(request.thinking_start_token_id, 41)
+        self.assertEqual(request.thinking_end_token_id, 42)
         self.assertFalse(request.separate_reasoning)
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
+
+    def test_responses_request_entropy_sampling_params(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="Hello",
+            entropy_penalty=1.5,
+            entropy_penalty_min_len=8,
+            entropy_penalty_max_len=64,
+            entropy_penalty_window=512,
+            entropy_penalty_max_penalty=4.0,
+            entropy_penalty_min_repetitions=3,
+            thinking_end_logit_boost=2.25,
+            thinking_end_logit_boost_start=20,
+            thinking_end_logit_boost_ramp=80,
+            thinking_start_token_id=51,
+            thinking_end_token_id=52,
+        )
+        params = request.to_sampling_params(default_max_tokens=100)
+        self.assertEqual(params["entropy_penalty"], 1.5)
+        self.assertEqual(params["entropy_penalty_min_len"], 8)
+        self.assertEqual(params["entropy_penalty_max_len"], 64)
+        self.assertEqual(params["entropy_penalty_window"], 512)
+        self.assertEqual(params["entropy_penalty_max_penalty"], 4.0)
+        self.assertEqual(params["entropy_penalty_min_repetitions"], 3)
+        self.assertEqual(params["thinking_end_logit_boost"], 2.25)
+        self.assertEqual(params["thinking_end_logit_boost_start"], 20)
+        self.assertEqual(params["thinking_end_logit_boost_ramp"], 80)
+        self.assertEqual(params["thinking_start_token_id"], 51)
+        self.assertEqual(params["thinking_end_token_id"], 52)
+
+    def test_responses_request_leaves_omitted_entropy_for_server_defaults(self):
+        request = ResponsesRequest(model="test-model", input="Hello")
+        params = request.to_sampling_params(default_max_tokens=100)
+        self.assertEqual(params["temperature"], 0.7)
+        self.assertEqual(params["top_p"], 1.0)
+        self.assertEqual(params["repetition_penalty"], 1.0)
+        self.assertIsNone(params["entropy_penalty"])
+        self.assertIsNone(params["entropy_penalty_min_len"])
+        self.assertIsNone(params["entropy_penalty_max_len"])
+        self.assertIsNone(params["entropy_penalty_window"])
+        self.assertIsNone(params["entropy_penalty_max_penalty"])
+        self.assertIsNone(params["entropy_penalty_min_repetitions"])
+        self.assertIsNone(params["thinking_end_logit_boost"])
+        self.assertIsNone(params["thinking_end_logit_boost_start"])
+        self.assertIsNone(params["thinking_end_logit_boost_ramp"])
+        self.assertIsNone(params["thinking_start_token_id"])
+        self.assertIsNone(params["thinking_end_token_id"])
 
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""

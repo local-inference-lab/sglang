@@ -361,6 +361,9 @@ class EagleVerifyInputV2Mixin:
                     sampling_info.logit_bias, self.draft_token_num, dim=0
                 )
             )
+        sampling_info.apply_thinking_end_logit_boost(
+            next_token_logits, repeat=self.draft_token_num
+        )
 
         # Apply grammar mask if provided
         if vocab_mask is not None:

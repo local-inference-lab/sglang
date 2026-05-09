@@ -63,6 +63,17 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
 | frequency_penalty  | `float = 0.0`          | Penalizes tokens based on their frequency in generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of penalization grows linearly with each appearance of a token. |
 | presence_penalty   | `float = 0.0`          | Penalizes tokens if they appeared in the generation so far. Must be between `-2` and `2` where negative numbers encourage repeatment of tokens and positive number encourages sampling of new tokens. The scaling of the penalization is constant if a token occurred. |
 | repetition_penalty | `float = 1.0`          | Scales the logits of previously generated tokens to discourage (values > 1) or encourage (values < 1) repetition. Valid range is `[0, 2]`; `1.0` leaves probabilities unchanged. |
+| entropy_penalty | `float = 0.0`          | Adds a logit penalty for candidate tokens that would continue a previously generated long span, using LZ77-style history matches plus periodic suffix detection for shorter blocks that become long in aggregate. The penalty scales linearly with the repeated span length and prior repeat count, up to `entropy_penalty_max_penalty`. `0.0` disables it. |
+| entropy_penalty_min_len | `int = 16` | Minimum repeated span length before `entropy_penalty` applies. Must be at least `1`. |
+| entropy_penalty_max_len | `int = 256` | Maximum repeated span length to score. Must be at least `entropy_penalty_min_len`. |
+| entropy_penalty_window | `int = 8192` | Output-token history window used by `entropy_penalty`. Must be at least `entropy_penalty_max_len`. |
+| entropy_penalty_max_penalty | `float = 8.0` | Per-token cap for the additive `entropy_penalty` logit penalty. |
+| entropy_penalty_min_repetitions | `int = 1` | Minimum candidate repeat count before `entropy_penalty` applies. `1` preserves the default behavior. |
+| thinking_end_logit_boost | `float = 0.0` | Adds up to this logit boost to the `</think>` token while the request is inside an open thinking block. The boost ramps with thinking depth after `thinking_end_logit_boost_start`; `0.0` disables it. |
+| thinking_end_logit_boost_start | `int = 0` | Number of tokens after the latest `<think>` token before `thinking_end_logit_boost` starts ramping. |
+| thinking_end_logit_boost_ramp | `int = 256` | Number of tokens over which `thinking_end_logit_boost` ramps to its full value after the cut-in. `0` applies the full boost immediately after the cut-in. |
+| thinking_start_token_id | `Optional[int] = None` | Token ID for `<think>`. If unset and `thinking_end_logit_boost > 0`, SGLang tries to infer it when `<think>` is a single tokenizer token. |
+| thinking_end_token_id | `Optional[int] = None` | Token ID for `</think>`. If unset and `thinking_end_logit_boost > 0`, SGLang tries to infer it when `</think>` is a single tokenizer token. |
 | min_new_tokens     | `int = 0`              | Forces the model to generate at least `min_new_tokens` until a stop word or EOS token is sampled. Note that this might lead to unintended behavior, for example, if the distribution is highly skewed towards these tokens. |
 
 ### Constrained decoding

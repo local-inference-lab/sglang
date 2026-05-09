@@ -189,6 +189,92 @@ class TestApplyLogitsBias(CustomTestCase):
         info.apply_logits_bias(logits)
         self.assertTrue(torch.equal(logits, original))
 
+    def test_thinking_end_logit_boost_ramps_in_open_block(self):
+        """Test that an open thinking block gets a ramped end-token boost."""
+        req = MagicMock()
+        req.origin_input_ids = [3, 10]
+        req.output_ids = [20, 21, 22]
+        info = _make_info(
+            batch_size=1,
+            has_thinking_end_logit_boost=True,
+            thinking_start_token_ids=[10],
+            thinking_end_token_ids=[11],
+            thinking_end_logit_boosts=[4.0],
+            thinking_end_logit_boost_start_tokens=[1],
+            thinking_end_logit_boost_ramp_tokens=[4],
+            thinking_end_logit_boost_reqs=[req],
+        )
+        logits = torch.zeros(1, VOCAB_SIZE)
+        info.apply_logits_bias(logits)
+        self.assertAlmostEqual(logits[0, 11].item(), 2.0, places=5)
+        self.assertAlmostEqual(logits[0, 0].item(), 0.0, places=5)
+
+    def test_thinking_end_logit_boost_skips_closed_block(self):
+        """Test that a closed thinking block is not boosted."""
+        req = MagicMock()
+        req.origin_input_ids = [10]
+        req.output_ids = [20, 11, 22]
+        info = _make_info(
+            batch_size=1,
+            has_thinking_end_logit_boost=True,
+            thinking_start_token_ids=[10],
+            thinking_end_token_ids=[11],
+            thinking_end_logit_boosts=[4.0],
+            thinking_end_logit_boost_start_tokens=[0],
+            thinking_end_logit_boost_ramp_tokens=[1],
+            thinking_end_logit_boost_reqs=[req],
+        )
+        logits = torch.zeros(1, VOCAB_SIZE)
+        info.apply_logits_bias(logits)
+        self.assertAlmostEqual(logits[0, 11].item(), 0.0, places=5)
+
+    def test_thinking_end_logit_boost_repeat(self):
+        """Test that repeated speculative rows receive the boost."""
+        req = MagicMock()
+        req.origin_input_ids = [10]
+        req.output_ids = [20, 21]
+        info = _make_info(
+            batch_size=1,
+            has_thinking_end_logit_boost=True,
+            thinking_start_token_ids=[10],
+            thinking_end_token_ids=[11],
+            thinking_end_logit_boosts=[3.0],
+            thinking_end_logit_boost_start_tokens=[0],
+            thinking_end_logit_boost_ramp_tokens=[2],
+            thinking_end_logit_boost_reqs=[req],
+        )
+        logits = torch.zeros(2, VOCAB_SIZE)
+        info.apply_thinking_end_logit_boost(logits, repeat=2)
+        self.assertAlmostEqual(logits[0, 11].item(), 3.0, places=5)
+        self.assertAlmostEqual(logits[1, 11].item(), 3.0, places=5)
+
+    def test_thinking_end_logit_boost_log_uses_fixed_interval(self):
+        """Test that thinking boost logging samples at a fixed interval."""
+        req = MagicMock()
+        req.rid = "req-1"
+        req.origin_input_ids = [10]
+        req.output_ids = [20, 21]
+        info = _make_info(
+            batch_size=1,
+            has_thinking_end_logit_boost=True,
+            thinking_start_token_ids=[10],
+            thinking_end_token_ids=[11],
+            thinking_end_logit_boosts=[3.0],
+            thinking_end_logit_boost_start_tokens=[0],
+            thinking_end_logit_boost_ramp_tokens=[2],
+            thinking_end_logit_boost_reqs=[req],
+            thinking_end_logit_boost_logged_applications=[127],
+        )
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        with self.assertLogs(
+            "sglang.srt.sampling.sampling_batch_info", level="INFO"
+        ) as log:
+            info.apply_thinking_end_logit_boost(logits)
+
+        self.assertIn("application_count=128", "\n".join(log.output))
+        self.assertIn("request_id=req-1", "\n".join(log.output))
+
 
 # update_penalties
 class TestUpdatePenalties(CustomTestCase):
@@ -324,6 +410,23 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([1], keep)
         self.assertIsNone(info.sampling_seed)
 
+    def test_filter_cleans_thinking_end_logit_boost_when_disabled_rows_remain(self):
+        """Test cleanup after filtering away all thinking boost requests."""
+        info = _make_info(
+            batch_size=2,
+            has_thinking_end_logit_boost=True,
+            thinking_start_token_ids=[10, None],
+            thinking_end_token_ids=[11, None],
+            thinking_end_logit_boosts=[2.0, 0.0],
+            thinking_end_logit_boost_start_tokens=[0, 0],
+            thinking_end_logit_boost_ramp_tokens=[8, 0],
+            thinking_end_logit_boost_reqs=[MagicMock(), None],
+        )
+        keep = torch.tensor([1])
+        info.filter_batch([1], keep)
+        self.assertFalse(info.has_thinking_end_logit_boost)
+        self.assertIsNone(info.thinking_end_logit_boosts)
+
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
@@ -403,6 +506,27 @@ class TestMergeBatch(CustomTestCase):
         self.assertEqual(info1.sampling_seed[1].item(), 20)
         self.assertEqual(info1.sampling_seed[2].item(), 30)
 
+    def test_merge_with_thinking_end_logit_boost(self):
+        """Test that merge pads thinking boost metadata for disabled rows."""
+        req = MagicMock()
+        info1 = _make_info(batch_size=1)
+        info2 = _make_info(
+            batch_size=1,
+            has_thinking_end_logit_boost=True,
+            thinking_start_token_ids=[10],
+            thinking_end_token_ids=[11],
+            thinking_end_logit_boosts=[2.0],
+            thinking_end_logit_boost_start_tokens=[3],
+            thinking_end_logit_boost_ramp_tokens=[16],
+            thinking_end_logit_boost_reqs=[req],
+        )
+        info1.merge_batch(info2)
+        self.assertTrue(info1.has_thinking_end_logit_boost)
+        self.assertEqual(info1.thinking_end_logit_boosts, [0.0, 2.0])
+        self.assertEqual(info1.thinking_start_token_ids, [None, 10])
+        self.assertEqual(info1.thinking_end_logit_boost_reqs, [None, req])
+        self.assertEqual(info1.thinking_end_logit_boost_logged_applications, [0, 0])
+
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
@@ -433,6 +557,11 @@ class TestFromScheduleBatch(CustomTestCase):
         seed=None,
         stop_ids=None,
         eos_id=2,
+        thinking_end_logit_boost=0.0,
+        thinking_end_logit_boost_start=0,
+        thinking_end_logit_boost_ramp=256,
+        thinking_start_token_id=None,
+        thinking_end_token_id=None,
     ):
         req = MagicMock()
         req.sampling_params.temperature = temp
@@ -446,6 +575,17 @@ class TestFromScheduleBatch(CustomTestCase):
         req.sampling_params.sampling_seed = seed
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
+        req.sampling_params.thinking_end_logit_boost = thinking_end_logit_boost
+        req.sampling_params.thinking_end_logit_boost_start = (
+            thinking_end_logit_boost_start
+        )
+        req.sampling_params.thinking_end_logit_boost_ramp = (
+            thinking_end_logit_boost_ramp
+        )
+        req.sampling_params.thinking_start_token_id = thinking_start_token_id
+        req.sampling_params.thinking_end_token_id = thinking_end_token_id
+        req.origin_input_ids = []
+        req.output_ids = []
         req.custom_logit_processor = None
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
@@ -540,6 +680,33 @@ class TestFromScheduleBatch(CustomTestCase):
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
         self.assertIsNone(info.logit_bias)
+
+    @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
+    def test_thinking_end_logit_boost_construction(self, mock_server_args):
+        """Test that thinking boost metadata is extracted from requests."""
+        mock_server_args.return_value.enable_deterministic_inference = False
+        mock_server_args.return_value.enable_custom_logit_processor = False
+
+        reqs = [
+            self._make_req(
+                thinking_end_logit_boost=3.0,
+                thinking_end_logit_boost_start=7,
+                thinking_end_logit_boost_ramp=64,
+                thinking_start_token_id=10,
+                thinking_end_token_id=11,
+            )
+        ]
+        batch = MagicMock()
+        batch.reqs = reqs
+        batch.device = DEVICE
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertTrue(info.has_thinking_end_logit_boost)
+        self.assertEqual(info.thinking_end_logit_boosts, [3.0])
+        self.assertEqual(info.thinking_end_logit_boost_start_tokens, [7])
+        self.assertEqual(info.thinking_end_logit_boost_ramp_tokens, [64])
+        self.assertEqual(info.thinking_start_token_ids, [10])
+        self.assertEqual(info.thinking_end_token_ids, [11])
+        self.assertEqual(info.thinking_end_logit_boost_logged_applications, [0])
 
     @patch("sglang.srt.sampling.sampling_batch_info.get_global_server_args")
     def test_custom_logit_processor_merging(self, mock_server_args):
