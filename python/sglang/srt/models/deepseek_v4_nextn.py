@@ -176,6 +176,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
+        self._b12x_wo_projection_workspace_cache = {}
         self.determine_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(

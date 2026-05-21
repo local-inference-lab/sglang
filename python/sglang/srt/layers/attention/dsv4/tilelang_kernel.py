@@ -91,11 +91,11 @@ def tilelang_fp8_paged_mqa_logits(
     weight: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
-    deep_gemm_metadata: Any,
+    metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    _ = deep_gemm_metadata
+    _ = metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
     assert head_dim == 128, "TODO"

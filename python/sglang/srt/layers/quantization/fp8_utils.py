@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _per_token_group_quant_8bit_raw,
     fp8_dtype,
     fp8_max,
     fp8_min,
@@ -126,6 +127,38 @@ use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 TORCH_DEVICE_IDENTITY = None
 
 
+def _uses_ue8m0_activation_scale(weight_scale: torch.Tensor) -> bool:
+    return (
+        bool(getattr(weight_scale, "activation_scale_ue8m0", False))
+        or bool(getattr(weight_scale, "format_ue8m0", False))
+        or (
+            hasattr(torch, "float8_e8m0fnu")
+            and weight_scale.dtype == torch.float8_e8m0fnu
+        )
+    )
+
+
+def _quantize_fp8_activation_for_block_gemm(
+    input_2d: torch.Tensor,
+    group_size: int,
+    *,
+    column_major_scales: bool,
+    scale_ue8m0: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if scale_ue8m0:
+        return _per_token_group_quant_8bit_raw(
+            input_2d.contiguous(),
+            group_size,
+            column_major_scales=column_major_scales,
+            scale_ue8m0=True,
+        )
+    return per_token_group_quant_fp8(
+        input_2d,
+        group_size,
+        column_major_scales=column_major_scales,
+    )
+
+
 def use_rowwise_torch_scaled_mm():
     if _is_hip:
         # The condition to determine if it is on a platform that supports
@@ -187,6 +220,7 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    B12X = "b12x"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -211,6 +245,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
+
+    def is_b12x(self) -> bool:
+        return self == Fp8GemmRunnerBackend.B12X
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
@@ -426,6 +463,14 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
             )
         return aiter_w8a8_block_fp8_linear
 
+    elif backend.is_b12x():
+        if not (_is_cuda and _is_sm120_supported):
+            raise RuntimeError(
+                "b12x block FP8 requested via --fp8-gemm-backend=b12x, "
+                "but this backend currently requires CUDA SM120."
+            )
+        return b12x_w8a8_block_fp8_linear
+
     elif backend.is_deep_gemm():
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -505,8 +550,11 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     # TRTLLM uses the existing SGLang column-major scale layout.
     # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
+    q_input, x_scale = _quantize_fp8_activation_for_block_gemm(
+        input_2d,
+        block_size[1],
+        column_major_scales=(backend == "trtllm"),
+        scale_ue8m0=_uses_ue8m0_activation_scale(weight_scale),
     )
     if backend == "cutlass":
         block_n, block_k = block_size
@@ -631,8 +679,11 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=True
+    q_input, x_scale = _quantize_fp8_activation_for_block_gemm(
+        input_2d,
+        block_size[1],
+        column_major_scales=True,
+        scale_ue8m0=_uses_ue8m0_activation_scale(weight_scale),
     )
     output = fp8_blockwise_scaled_mm(
         q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
@@ -823,8 +874,11 @@ def triton_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
+    q_input, x_scale = _quantize_fp8_activation_for_block_gemm(
+        input_2d,
+        block_size[1],
+        column_major_scales=False,
+        scale_ue8m0=_uses_ue8m0_activation_scale(weight_scale),
     )
     output = w8a8_block_fp8_matmul_triton(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
@@ -832,6 +886,30 @@ def triton_w8a8_block_fp8_linear(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def b12x_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if input_scale is not None:
+        raise RuntimeError(
+            "b12x block FP8 linear expects BF16/FP16 activations and does not "
+            "accept pre-quantized activation tuples yet."
+        )
+    packed_weight = getattr(weight, "b12x_block_fp8_linear_weight", None)
+    if packed_weight is None:
+        raise RuntimeError(
+            "b12x block FP8 linear requested before load-time b12x weight packing. "
+            "This indicates process_weights_after_loading did not run for this layer."
+        )
+    from b12x.gemm import block_fp8_linear_mxfp8
+
+    return block_fp8_linear_mxfp8(input, packed_weight, bias=bias)
 
 
 @lru_cache(maxsize=1)

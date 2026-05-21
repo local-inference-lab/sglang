@@ -485,6 +485,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             w2_fp4=self.experts.w2_weight,
             w2_blockscale=self.experts.w2_blockscale_swizzled,
             w2_alphas=self.experts.g2_alphas,
+            source_format="modelopt",
         )
         return b12x_sparse_moe_fp4(
             hidden_states,
@@ -494,6 +495,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             gate_weight=self.gate.weight,
             gate_bias=getattr(self.gate, "bias", None),
             renormalize_topk=topk_config.renormalize,
+            activation="silu",
+            quant_mode="nvfp4",
             output=symm_output,
             input_scales_static=True,
         )

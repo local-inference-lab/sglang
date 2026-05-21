@@ -142,6 +142,7 @@ def _per_token_group_quant_8bit(
     bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     """A Triton-accelerated function to perform per-token-group quantization on a
     tensor.
@@ -161,8 +162,9 @@ def _per_token_group_quant_8bit(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / bit8_max
-    y_s_inv = 1.0 / y_s
-    y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
+    if SCALE_UE8M0:
+        y_s = tl.exp2(tl.ceil(tl.log2(y_s)))
+    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -268,7 +270,7 @@ def _per_token_group_quant_8bit_raw(
         group_size=group_size,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=False,
+        scale_ue8m0=scale_ue8m0,
     )
 
     M = x.numel() // group_size
@@ -295,7 +297,6 @@ def _per_token_group_quant_8bit_raw(
             SCALE_UE8M0=scale_ue8m0,
         )
     else:
-        assert not scale_ue8m0
         _per_token_group_quant_8bit[(M,)](
             x,
             x_q,
@@ -308,9 +309,10 @@ def _per_token_group_quant_8bit_raw(
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
+            SCALE_UE8M0=scale_ue8m0,
         )
 
-    if scale_ue8m0:
+    if scale_ue8m0 and column_major_scales:
         from deep_gemm import transform_sf_into_required_layout
 
         assert group_size == 128
@@ -441,8 +443,7 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
-    if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
+    if scale_ue8m0 and column_major_scales and scale_tma_aligned:
         *x_batch, x_q_mn, x_q_k = x_shape
         x_s_mn, x_s_k = x_q_mn, x_q_k // 128
         aligned_mn = ceil_align(x_s_mn, 4)

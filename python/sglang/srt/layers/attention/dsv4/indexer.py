@@ -8,13 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import (
-    fused_rope,
-    topk_transform_512,
-    topk_transform_512_v2,
-)
+from sglang.jit_kernel.deepseek_v4 import fused_rope
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
@@ -47,11 +42,11 @@ def fp8_paged_mqa_logits_torch(
     weight: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
-    deep_gemm_metadata: Any,
+    metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    _ = deep_gemm_metadata
+    _ = metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
 
@@ -91,99 +86,6 @@ def fp8_paged_mqa_logits_torch(
         logits[i, :seq_len] = score[:seq_len]
 
     return logits
-
-
-def topk_transform_512_pytorch_vectorized(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
-    out_page_indices: torch.Tensor,
-    page_size: int,
-    out_raw_indices: Optional[torch.Tensor] = None,
-) -> None:
-
-    TOPK = 512
-    batch_size = scores.shape[0]
-    max_seq_len = scores.shape[1]
-    device = scores.device
-
-    page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
-    page_mask = page_size - 1
-
-    positions = (
-        torch.arange(max_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    )
-    valid_mask = positions < seq_lens.unsqueeze(1)
-
-    masked_scores = scores.clone()
-    masked_scores[~valid_mask] = float("-inf")
-
-    actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
-    )
-    raw_indices = raw_indices.to(torch.int32)
-
-    if actual_k < TOPK:
-        padding = torch.zeros(
-            (batch_size, TOPK - actual_k), dtype=torch.int32, device=device
-        )
-        raw_indices = torch.cat([raw_indices, padding], dim=1)
-
-    batch_indices = (
-        torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, TOPK)
-    )
-    gathered_scores = scores[
-        batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-    ].view(batch_size, TOPK)
-
-    valid_topk = gathered_scores != float("-inf")
-    if actual_k < TOPK:
-        pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
-        valid_topk = valid_topk & ~pad_mask
-
-    needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
-
-        raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
-            raw_indices,
-        )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
-
-    page_idx = raw_indices >> page_bits
-    offset_in_page = raw_indices & page_mask
-
-    page_idx_clamped = torch.clamp(page_idx, min=0)
-    physical_pages = torch.gather(page_tables, dim=1, index=page_idx_clamped.long())
-
-    page_indices = (physical_pages << page_bits) | offset_in_page
-    page_indices = page_indices.to(torch.int32)
-
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
-
-    out_page_indices.copy_(page_indices)
-
-    if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
-        out_raw_indices.copy_(raw_indices)
 
 
 @triton.jit
@@ -366,39 +268,7 @@ class C4IndexerBackendMixin:
             )
 
         assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)
         assert len(c4_indexer_kv_cache.shape) == 2
-        block_kv = 64
-        num_heads_kv = 1
-        head_dim_with_sf = 132
-
-        c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-            c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            fn = fp8_paged_mqa_logits_torch
-        else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
-
-        _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
-            _c4sl = _c4sl.unsqueeze(-1)
-        logits = fn(
-            q_fp8,
-            c4_indexer_kv_cache,
-            weights,
-            _c4sl,
-            indexer_metadata.page_table,
-            indexer_metadata.deep_gemm_metadata,
-            indexer_metadata.max_c4_seq_len,
-            False,
-        )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -412,40 +282,55 @@ class C4IndexerBackendMixin:
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
 
-        raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
-        elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
+        selected_raw_indices = core_metadata.c4_sparse_page_indices
+        if hisparse_decode:
+            selected_raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            topk_transform_512_v2(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
+        from b12x.integration.paged_mqa_indexer import (
+            paged_mqa_index_decode_dense_topk_fp8,
+            paged_mqa_index_decode_supertile_topk_fp8,
+        )
+
+        use_dense_decode = forward_batch.forward_mode.is_decode_or_idle()
+        workspace = self.get_b12x_indexer_paged_workspace(
+            forward_batch=forward_batch,
+            q_rows=q_fp8.shape[0],
+            page_table_width=indexer_metadata.page_table.shape[1],
+            logits_mode="dense" if use_dense_decode else "tiled",
+        )
+        if use_dense_decode:
+            paged_mqa_index_decode_dense_topk_fp8(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=c4_indexer_kv_cache,
+                metadata=indexer_metadata.b12x_metadata,
+                page_size=indexer_metadata.c4_page_size,
+                topk=core_metadata.c4_sparse_page_indices.shape[1],
+                expected_num_q_heads=indexer_metadata.expected_num_q_heads,
+                workspace=workspace,
+                out_indices=selected_raw_indices,
             )
         else:
-            topk_transform_512(
-                logits,
-                indexer_metadata.c4_seq_lens,
-                core_metadata.page_table,
-                core_metadata.c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
+            workspace_q_rows = int(
+                getattr(workspace, "max_paged_q_rows", q_fp8.shape[0])
+            )
+            supertile_k = self._b12x_c4_indexer_supertile_tokens_capacity(
+                page_table_width=self._b12x_indexer_page_table_width_capacity(),
+                q_rows=workspace_q_rows,
+            )
+            paged_mqa_index_decode_supertile_topk_fp8(
+                q_fp8=q_fp8,
+                weights=weights,
+                index_k_cache=c4_indexer_kv_cache,
+                metadata=indexer_metadata.b12x_metadata,
+                page_size=indexer_metadata.c4_page_size,
+                topk=core_metadata.c4_sparse_page_indices.shape[1],
+                expected_num_q_heads=indexer_metadata.expected_num_q_heads,
+                workspace=workspace,
+                out_indices=selected_raw_indices,
+                supertile_k=supertile_k,
             )
         if hisparse_coordinator is not None:
             if hisparse_decode:
@@ -456,7 +341,7 @@ class C4IndexerBackendMixin:
                     hisparse_coordinator.swap_in_selected_pages(
                         req_pool_indices=forward_batch.req_pool_indices,
                         compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
+                        top_k_result=selected_raw_indices,
                         layer_id=compress_layer_id,
                     )
                 )
@@ -471,7 +356,7 @@ class C4IndexerBackendMixin:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
-            indexer_capturer.capture(compress_layer_id, raw_indices)
+            indexer_capturer.capture(compress_layer_id, selected_raw_indices)
 
 
 class C4Indexer(nn.Module):
@@ -492,7 +377,11 @@ class C4Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
+        # The C4 selector is replicated across attention TP ranks, matching the
+        # GLM/NSA indexer contract. Attention heads are sharded separately.
         self.n_local_heads = self.n_heads
+        self.local_head_start = 0
+        self.local_head_end = self.n_heads
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -525,7 +414,7 @@ class C4Indexer(nn.Module):
 
     def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         q, _ = self.wq_b(q_lora)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
+        q = q.view(-1, self.n_heads, self.head_dim)
         fused_rope(
             q[..., -self.rope_head_dim :],
             None,
@@ -533,10 +422,12 @@ class C4Indexer(nn.Module):
             positions=positions,
         )
         q = rotate_activation(q)
+        q = q.contiguous()
         return q
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)
+        out = out.contiguous()
         if not skip_scale:
             out = out * self.weight_scale
         return out

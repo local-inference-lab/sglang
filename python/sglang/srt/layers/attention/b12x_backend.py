@@ -19,6 +19,17 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 _B12X_PAGE_SIZE = 64
+_DECODE_GRAPH_METADATA_BUFFER_ATTRS = (
+    "request_indices",
+    "qo_tile_indices",
+    "kv_tile_indices",
+    "merge_indptr",
+    "o_indptr",
+    "kv_chunk_size_ptr",
+    "kv_window_start_tokens",
+    "total_num_rows_ptr",
+    "block_valid_mask",
+)
 
 
 def _b12x_config_candidates(cfg):
@@ -57,9 +68,17 @@ class B12xForwardMetadata:
     swa_page_table: torch.Tensor | None
     mode: str
     use_cuda_graph: bool
+    active_total_q: int
     graph_key: tuple[object, ...] | None = None
     req_pool_indices: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    decode_preprocess_in_graph: bool = False
     prepared_workspace_keys: frozenset[tuple[object, ...]] = frozenset()
+
+
+@dataclass(frozen=True)
+class _DecodeGraphPreparePlan:
+    metadata_sources: tuple[PagedAttentionWorkspace, ...]
 
 
 class B12xAttnBackend(AttentionBackend):
@@ -130,13 +149,18 @@ class B12xAttnBackend(AttentionBackend):
             self.num_kv_heads = max(
                 int(layer.tp_k_head_num) for layer in self.attention_layers
             )
-        self._validate_kv_cache_dtype_contract()
         self.num_cache_pages = self._max_num_cache_pages()
 
         self.forward_metadata: Optional[B12xForwardMetadata] = None
         self.eager_workspaces: dict[tuple[object, ...], PagedAttentionWorkspace] = {}
         self.cuda_graph_workspaces: dict[
             tuple[object, ...], PagedAttentionWorkspace
+        ] = {}
+        self.cuda_graph_decode_metadata_sources: dict[
+            tuple[object, ...], PagedAttentionWorkspace
+        ] = {}
+        self.cuda_graph_prepare_plans: dict[
+            tuple[object, ...], _DecodeGraphPreparePlan
         ] = {}
         self.fp8_descale_cache: dict[
             tuple[int, int, float, float], tuple[torch.Tensor, torch.Tensor]
@@ -163,6 +187,9 @@ class B12xAttnBackend(AttentionBackend):
         mode = self._mode_from_forward_mode(forward_batch.forward_mode)
         cache_seqlens = self._build_cache_seqlens(forward_batch, bs, mode)
         cu_seqlens_q = self._build_eager_cu_seqlens_q(forward_batch, bs, mode)
+        active_total_q = self._active_total_q_from_forward_batch(
+            forward_batch, bs, mode
+        )
         page_table, swa_page_table = self._build_page_tables(
             forward_batch.req_pool_indices[:bs], cache_seqlens
         )
@@ -174,6 +201,7 @@ class B12xAttnBackend(AttentionBackend):
                 page_table=page_table,
                 swa_page_table=swa_page_table,
                 cu_seqlens_q=cu_seqlens_q,
+                active_total_q=active_total_q,
             )
         self.forward_metadata = B12xForwardMetadata(
             cu_seqlens_q=cu_seqlens_q,
@@ -182,6 +210,7 @@ class B12xAttnBackend(AttentionBackend):
             swa_page_table=swa_page_table,
             mode=mode,
             use_cuda_graph=False,
+            active_total_q=active_total_q,
             req_pool_indices=(
                 forward_batch.req_pool_indices[:bs] if mode == "decode" else None
             ),
@@ -218,6 +247,8 @@ class B12xAttnBackend(AttentionBackend):
         self.cuda_graph_row_indices = torch.arange(
             max_bs, dtype=torch.long, device=self.device
         )
+        self.cuda_graph_decode_metadata_sources.clear()
+        self.cuda_graph_prepare_plans.clear()
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -235,14 +266,14 @@ class B12xAttnBackend(AttentionBackend):
         mode = self._mode_from_forward_mode(forward_mode)
         graph_key = (mode, bs)
         if mode == "decode":
+            build_decode_page_table = False
+            decode_preprocess_in_graph = True
             cache_seqlens, page_table, swa_page_table, cu_seqlens_q = (
-                self._fill_decode_cuda_graph_metadata(
-                    bs=bs,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
-                )
+                self._decode_cuda_graph_metadata_views(bs)
             )
         else:
+            build_decode_page_table = True
+            decode_preprocess_in_graph = False
             cache_seqlens, page_table, swa_page_table, cu_seqlens_q = (
                 self._fill_cuda_graph_metadata(
                     bs=bs,
@@ -262,6 +293,10 @@ class B12xAttnBackend(AttentionBackend):
             page_table=page_table,
             swa_page_table=swa_page_table,
             cu_seqlens_q=cu_seqlens_q,
+            req_pool_indices=req_pool_indices[:bs] if mode == "decode" else None,
+            decode_page_table_prebuilt=build_decode_page_table,
+            decode_preprocess_in_graph=decode_preprocess_in_graph,
+            reset_decode_preprocess_capture=decode_preprocess_in_graph,
         )
         self.forward_metadata = B12xForwardMetadata(
             cu_seqlens_q=cu_seqlens_q,
@@ -270,8 +305,11 @@ class B12xAttnBackend(AttentionBackend):
             swa_page_table=swa_page_table,
             mode=mode,
             use_cuda_graph=True,
+            active_total_q=bs if mode == "decode" else num_tokens,
             graph_key=graph_key,
             req_pool_indices=req_pool_indices[:bs] if mode == "decode" else None,
+            seq_lens=seq_lens[:bs] if mode == "decode" else None,
+            decode_preprocess_in_graph=decode_preprocess_in_graph,
         )
 
     def init_forward_metadata_replay_cuda_graph_no_cpu(
@@ -290,14 +328,26 @@ class B12xAttnBackend(AttentionBackend):
         mode = self._mode_from_forward_mode(forward_mode)
         graph_key = (mode, bs)
         if mode == "decode":
-            cache_seqlens, page_table, swa_page_table, cu_seqlens_q = (
-                self._fill_decode_cuda_graph_metadata(
-                    bs=bs,
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
-                )
+            decode_preprocess_in_graph = (
+                self._decode_graph_prepare_plan_metadata_captured(graph_key)
             )
+            build_decode_page_table = not decode_preprocess_in_graph
+            if decode_preprocess_in_graph:
+                cache_seqlens, page_table, swa_page_table, cu_seqlens_q = (
+                    self._decode_cuda_graph_metadata_views(bs)
+                )
+            else:
+                cache_seqlens, page_table, swa_page_table, cu_seqlens_q = (
+                    self._fill_decode_cuda_graph_metadata(
+                        bs=bs,
+                        req_pool_indices=req_pool_indices,
+                        seq_lens=seq_lens,
+                        build_page_table=build_decode_page_table,
+                    )
+                )
         else:
+            build_decode_page_table = True
+            decode_preprocess_in_graph = False
             cache_seqlens, page_table, swa_page_table, cu_seqlens_q = (
                 self._fill_cuda_graph_metadata(
                     bs=bs,
@@ -317,7 +367,11 @@ class B12xAttnBackend(AttentionBackend):
         else:
             total_q_capacity = self._captured_graph_total_q_capacity(graph_key)
             if total_q_capacity is None:
-                total_q_capacity = int(cu_seqlens_q[-1].item())
+                total_q_capacity = self._cuda_graph_total_q_hint_from_host(
+                    bs=bs,
+                    seq_lens_sum=seq_lens_sum,
+                    spec_info=spec_info,
+                )
 
         self._prepare_cuda_graph_workspaces(
             graph_key,
@@ -328,6 +382,10 @@ class B12xAttnBackend(AttentionBackend):
             page_table=page_table,
             swa_page_table=swa_page_table,
             cu_seqlens_q=cu_seqlens_q,
+            req_pool_indices=req_pool_indices[:bs] if mode == "decode" else None,
+            decode_page_table_prebuilt=build_decode_page_table,
+            decode_preprocess_in_graph=decode_preprocess_in_graph,
+            reset_decode_preprocess_capture=False,
         )
         self._record_cuda_graph_metadata_ready_for_overlap(mode)
         self.forward_metadata = B12xForwardMetadata(
@@ -337,8 +395,11 @@ class B12xAttnBackend(AttentionBackend):
             swa_page_table=swa_page_table,
             mode=mode,
             use_cuda_graph=True,
+            active_total_q=bs if mode == "decode" else total_q_capacity,
             graph_key=graph_key,
             req_pool_indices=req_pool_indices[:bs] if mode == "decode" else None,
+            seq_lens=seq_lens[:bs] if mode == "decode" else None,
+            decode_preprocess_in_graph=decode_preprocess_in_graph,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -388,21 +449,12 @@ class B12xAttnBackend(AttentionBackend):
         if out_cache_loc is None or not forward_mode.is_decode_or_idle():
             return
         md = self._require_forward_metadata("decode")
+        if md.decode_preprocess_in_graph:
+            return
         if out_cache_loc.shape[0] < bs:
             return
-        valid_rows = md.cache_seqlens.ne(
-            self.get_cuda_graph_seq_len_fill_value()
-        ) | out_cache_loc[:bs].ne(0)
-        invalid_rows = valid_rows.logical_not()
-        md.page_table.masked_fill_(invalid_rows[:, None], 0)
-        if md.swa_page_table is not None:
-            md.swa_page_table.masked_fill_(invalid_rows[:, None], 0)
-        md.cache_seqlens.copy_(
-            torch.where(valid_rows, md.cache_seqlens, torch.ones_like(md.cache_seqlens))
-        )
-        self._refresh_decode_graph_current_pages_from_cache_loc(
+        self._sanitize_decode_graph_padding_metadata_from_cache_loc(
             md,
-            valid_rows=valid_rows,
             out_cache_loc=out_cache_loc[:bs],
         )
 
@@ -421,7 +473,8 @@ class B12xAttnBackend(AttentionBackend):
             return
         if self.cuda_graph_metadata_ready_event is None:
             self.cuda_graph_metadata_ready_event = torch.cuda.Event(blocking=False)
-        self.cuda_graph_metadata_ready_event.record(torch.cuda.current_stream())
+        stream = torch.cuda.current_stream(self.device)
+        self.cuda_graph_metadata_ready_event.record(stream)
 
     def forward_decode(
         self,
@@ -447,15 +500,17 @@ class B12xAttnBackend(AttentionBackend):
             )
 
         md = self._require_forward_metadata("decode")
-        self._sanitize_decode_graph_padding_metadata(md, forward_batch)
+        self._stage_decode_graph_preprocess_for_layer(md, layer, forward_batch)
         workspace = self._get_workspace(
             md, total_q=q.shape[0], layer=layer, has_sinks=sinks is not None
         )
+        window_left = self._layer_window_left(layer)
         workspace.prepare(
             self._page_table_for_layer(md, layer),
             md.cache_seqlens,
             md.cu_seqlens_q,
-            window_left=self._layer_window_left(layer),
+            window_left=window_left,
+            active_total_q=md.active_total_q,
         )
 
         k_cache, v_cache = self._get_paged_kv_buffers(
@@ -472,6 +527,12 @@ class B12xAttnBackend(AttentionBackend):
         k_descale, v_descale = self._get_descale_tensors(
             layer, md.cache_seqlens.shape[0]
         )
+        prepare_decode_graph_metadata = self._decode_graph_run_prepare_metadata(
+            md,
+            layer,
+            workspace,
+            window_left=window_left,
+        )
         out, _ = workspace.run(
             q3,
             k_cache,
@@ -480,6 +541,14 @@ class B12xAttnBackend(AttentionBackend):
             k_descale=k_descale,
             v_descale=v_descale,
             attention_sink_bias=sinks,
+            prepare_decode_graph_metadata=prepare_decode_graph_metadata,
+        )
+        self._mark_decode_graph_metadata_captured(
+            md,
+            layer,
+            workspace,
+            window_left=window_left,
+            prepared=prepare_decode_graph_metadata,
         )
         return out.view(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
@@ -575,6 +644,124 @@ class B12xAttnBackend(AttentionBackend):
             )
         return self.forward_metadata
 
+    @torch._dynamo.disable
+    def _stage_decode_graph_preprocess_for_layer(
+        self,
+        md: B12xForwardMetadata,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if not md.decode_preprocess_in_graph:
+            self._sanitize_decode_graph_padding_metadata(md, forward_batch)
+            return
+        if not self._is_first_attention_layer(layer):
+            return
+        if md.req_pool_indices is None or md.seq_lens is None:
+            raise RuntimeError("b12x decode graph preprocessing requires replay inputs")
+
+        self._stage_decode_graph_metadata(
+            md,
+            req_pool_indices=md.req_pool_indices,
+            seq_lens=md.seq_lens,
+        )
+        self._sanitize_decode_graph_padding_metadata(md, forward_batch)
+
+    def _stage_decode_graph_metadata(
+        self,
+        md: B12xForwardMetadata,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        bs = md.cache_seqlens.shape[0]
+        if (
+            md.cache_seqlens.device.type == "cuda"
+            and md.page_table.device == md.cache_seqlens.device
+            and req_pool_indices.device == md.cache_seqlens.device
+            and seq_lens.device == md.cache_seqlens.device
+            and self.req_to_token.device == md.cache_seqlens.device
+        ):
+            swa_index_mapping = (
+                None
+                if md.swa_page_table is None
+                else getattr(self.swa_kv_pool, "full_to_swa_index_mapping", None)
+            )
+            if md.swa_page_table is None or swa_index_mapping is not None:
+                from b12x.attention.paged.graph_replay import (
+                    stage_decode_cuda_graph_metadata,
+                )
+
+                stage_decode_cuda_graph_metadata(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices[:bs],
+                    seq_lens=seq_lens[:bs],
+                    cache_seqlens=md.cache_seqlens,
+                    cu_seqlens_q=md.cu_seqlens_q,
+                    page_table=md.page_table,
+                    swa_page_table=md.swa_page_table,
+                    swa_index_mapping=swa_index_mapping,
+                    page_size=self.page_size,
+                )
+                return
+
+        md.cache_seqlens.copy_(seq_lens[:bs].to(torch.int32))
+        md.cu_seqlens_q.copy_(
+            torch.arange(0, bs + 1, dtype=torch.int32, device=md.cu_seqlens_q.device)
+        )
+        self._build_page_tables_into(
+            req_pool_indices[:bs],
+            md.cache_seqlens,
+            md.page_table,
+            md.swa_page_table,
+            bs,
+            max_pages=md.page_table.shape[1],
+        )
+
+    @torch._dynamo.disable
+    def _decode_graph_run_prepare_metadata(
+        self,
+        md: B12xForwardMetadata,
+        layer: RadixAttention,
+        workspace: PagedAttentionWorkspace,
+        *,
+        window_left: int,
+    ) -> bool | None:
+        if not md.use_cuda_graph:
+            return None
+        if not md.decode_preprocess_in_graph:
+            return False
+        if self.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
+            return False
+        source = self._decode_graph_metadata_source(md, layer, window_left=window_left)
+        if source is None or getattr(source, "_decode_graph_metadata_captured_in_graph", False):
+            return False
+        return self._workspace_shares_decode_graph_metadata(workspace, source)
+
+    @torch._dynamo.disable
+    def _mark_decode_graph_metadata_captured(
+        self,
+        md: B12xForwardMetadata,
+        layer: RadixAttention,
+        workspace: PagedAttentionWorkspace,
+        *,
+        window_left: int,
+        prepared: bool | None,
+    ) -> None:
+        if not prepared:
+            return
+        if self.device.type != "cuda" or not torch.cuda.is_current_stream_capturing():
+            return
+        source = self._decode_graph_metadata_source(md, layer, window_left=window_left)
+        if source is None:
+            return
+        if self._workspace_shares_decode_graph_metadata(workspace, source):
+            source._decode_graph_metadata_captured_in_graph = True
+
+    def _is_first_attention_layer(self, layer: RadixAttention) -> bool:
+        return bool(self.attention_layers) and int(layer.layer_id) == int(
+            self.attention_layers[0].layer_id
+        )
+
     def _sanitize_decode_graph_padding_metadata(
         self, md: B12xForwardMetadata, forward_batch: ForwardBatch
     ) -> None:
@@ -588,10 +775,42 @@ class B12xAttnBackend(AttentionBackend):
         bs = md.cache_seqlens.shape[0]
         if out_cache_loc.shape[0] < bs:
             return
+        out_cache_loc_swa = getattr(forward_batch, "out_cache_loc_swa", None)
+        self._sanitize_decode_graph_padding_metadata_from_cache_loc(
+            md,
+            out_cache_loc=out_cache_loc[:bs],
+            out_cache_loc_swa=out_cache_loc_swa[:bs]
+            if out_cache_loc_swa is not None and out_cache_loc_swa.shape[0] >= bs
+            else None,
+        )
+
+    def _sanitize_decode_graph_padding_metadata_from_cache_loc(
+        self,
+        md: B12xForwardMetadata,
+        *,
+        out_cache_loc: torch.Tensor,
+        out_cache_loc_swa: Optional[torch.Tensor] = None,
+    ) -> None:
+        bs = md.cache_seqlens.shape[0]
+        if out_cache_loc.shape[0] < bs:
+            return
+        out_cache_loc = out_cache_loc[:bs]
+        if out_cache_loc_swa is not None:
+            if out_cache_loc_swa.shape[0] < bs:
+                out_cache_loc_swa = None
+            else:
+                out_cache_loc_swa = out_cache_loc_swa[:bs]
+
+        if self._patch_decode_graph_padding_metadata_with_b12x(
+            md,
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
+        ):
+            return
 
         valid_rows = md.cache_seqlens.ne(
             self.get_cuda_graph_seq_len_fill_value()
-        ) | out_cache_loc[:bs].ne(0)
+        ) | out_cache_loc.ne(0)
         invalid_rows = valid_rows.logical_not()
         md.page_table.masked_fill_(invalid_rows[:, None], 0)
         if md.swa_page_table is not None:
@@ -600,8 +819,52 @@ class B12xAttnBackend(AttentionBackend):
             torch.where(valid_rows, md.cache_seqlens, torch.ones_like(md.cache_seqlens))
         )
         self._refresh_decode_graph_current_pages_from_cache_loc(
-            md, valid_rows=valid_rows, forward_batch=forward_batch
+            md,
+            valid_rows=valid_rows,
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
         )
+
+    def _patch_decode_graph_padding_metadata_with_b12x(
+        self,
+        md: B12xForwardMetadata,
+        *,
+        out_cache_loc: torch.Tensor,
+        out_cache_loc_swa: Optional[torch.Tensor] = None,
+    ) -> bool:
+        if md.cache_seqlens.device.type != "cuda":
+            return False
+        if (
+            md.page_table.device != md.cache_seqlens.device
+            or out_cache_loc.device != md.cache_seqlens.device
+        ):
+            return False
+        if md.swa_page_table is not None and md.swa_page_table.device != md.cache_seqlens.device:
+            return False
+        if out_cache_loc_swa is not None and out_cache_loc_swa.device != md.cache_seqlens.device:
+            return False
+
+        swa_index_mapping = None
+        if md.swa_page_table is not None and out_cache_loc_swa is None:
+            swa_index_mapping = getattr(self.swa_kv_pool, "full_to_swa_index_mapping", None)
+            if swa_index_mapping is None or swa_index_mapping.device != md.cache_seqlens.device:
+                return False
+
+        from b12x.attention.paged.graph_replay import (
+            patch_decode_cuda_graph_current_pages,
+        )
+
+        patch_decode_cuda_graph_current_pages(
+            cache_seqlens=md.cache_seqlens,
+            page_table=md.page_table,
+            out_cache_loc=out_cache_loc,
+            page_size=self.page_size,
+            fill_value=self.get_cuda_graph_seq_len_fill_value(),
+            swa_page_table=md.swa_page_table,
+            out_cache_loc_swa=out_cache_loc_swa,
+            swa_index_mapping=swa_index_mapping,
+        )
+        return True
 
     def _refresh_decode_graph_current_pages_from_cache_loc(
         self,
@@ -723,6 +986,7 @@ class B12xAttnBackend(AttentionBackend):
         page_table: torch.Tensor,
         swa_page_table: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
+        active_total_q: int,
     ) -> frozenset[tuple[object, ...]]:
         if not self.eager_attention_layers:
             raise RuntimeError(
@@ -736,6 +1000,7 @@ class B12xAttnBackend(AttentionBackend):
             swa_page_table=swa_page_table,
             mode=mode,
             use_cuda_graph=False,
+            active_total_q=active_total_q,
         )
         prepared_keys: set[tuple[object, ...]] = set()
         for layer in self.eager_attention_layers:
@@ -749,6 +1014,7 @@ class B12xAttnBackend(AttentionBackend):
                 cache_seqlens,
                 cu_seqlens_q,
                 window_left=self._layer_window_left(layer),
+                active_total_q=active_total_q,
             )
             prepared_keys.add(workspace_key)
         return frozenset(prepared_keys)
@@ -968,17 +1234,15 @@ class B12xAttnBackend(AttentionBackend):
             elif mode == "verify":
                 max_batch = max(1, int(bs))
                 max_page_table_width = self.max_pages_per_req
-                max_work_items, max_partial_rows = (
-                    self._paged_verify_graph_capacities(
-                        batch_capacity=max_batch,
-                        total_q_capacity=total_q_capacity,
-                        head_dim_qk=head_dim_qk,
-                        head_dim_vo=head_dim_vo,
-                        num_q_heads=num_q_heads,
-                        num_kv_heads=num_kv_heads,
-                        window_left=window_left,
-                        num_cache_pages=num_cache_pages,
-                    )
+                max_work_items, max_partial_rows = self._paged_verify_graph_capacities(
+                    batch_capacity=max_batch,
+                    total_q_capacity=total_q_capacity,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                    num_q_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    window_left=window_left,
+                    num_cache_pages=num_cache_pages,
                 )
             else:
                 max_batch = max(1, int(bs))
@@ -1136,8 +1400,7 @@ class B12xAttnBackend(AttentionBackend):
         # smallest split size that fills the resident graph work-item budget.
         graph_budget_chunks_per_req = max(
             1,
-            int(graph_split_capacity)
-            // max(1, batch_capacity * q_tiles_per_req),
+            int(graph_split_capacity) // max(1, batch_capacity * q_tiles_per_req),
         )
         max_work_items = max(1, int(q_tile_capacity) * int(max_chunks_per_req))
         max_work_items = max(max_work_items, graph_split_capacity)
@@ -1260,6 +1523,7 @@ class B12xAttnBackend(AttentionBackend):
         return B12XMoEArenaCaps(
             device=self.device,
             dtype=self.q_dtype,
+            quant_mode="nvfp4",
             weight_E=int(weight_E),
             k=int(hidden_size),
             n=intermediate_size // tp_size,
@@ -1319,13 +1583,35 @@ class B12xAttnBackend(AttentionBackend):
         page_table: torch.Tensor,
         swa_page_table: torch.Tensor | None,
         cu_seqlens_q: torch.Tensor,
+        req_pool_indices: torch.Tensor | None = None,
+        decode_page_table_prebuilt: bool = True,
+        decode_preprocess_in_graph: bool = False,
+        reset_decode_preprocess_capture: bool = False,
     ) -> None:
         if not self.attention_layers:
             raise RuntimeError(
                 "b12x backend could not find RadixAttention layers for CUDA graph capture"
             )
+        if not hasattr(self, "cuda_graph_prepare_plans"):
+            self.cuda_graph_prepare_plans = {}
+
+        if mode == "decode":
+            cached_plan = self.cuda_graph_prepare_plans.get(graph_key)
+            if cached_plan is not None:
+                if reset_decode_preprocess_capture:
+                    self._reset_decode_graph_metadata_capture(graph_key)
+                if not decode_preprocess_in_graph:
+                    self._update_decode_graph_prepare_plan(
+                        cached_plan,
+                        req_pool_indices=req_pool_indices,
+                        decode_page_table_prebuilt=decode_page_table_prebuilt,
+                    )
+                return
 
         prepared_workspace_keys: set[tuple[object, ...]] = set()
+        decode_metadata_sources: dict[
+            tuple[object, ...], PagedAttentionWorkspace
+        ] = {}
         has_sinks_options = (False, True) if self.has_attention_sinks else (False,)
         for layer in self.attention_layers:
             self._validate_layer_contract(layer)
@@ -1361,6 +1647,16 @@ class B12xAttnBackend(AttentionBackend):
                     continue
                 prepared_workspace_keys.add(workspace_key)
                 if mode == "decode":
+                    metadata_key = self._decode_graph_metadata_key(
+                        graph_key,
+                        layer,
+                        window_left=window_left,
+                    )
+                    metadata_source = self._ensure_decode_graph_metadata_source(
+                        workspace,
+                        metadata_key,
+                    )
+                    decode_metadata_sources.setdefault(metadata_key, metadata_source)
                     self._bind_decode_graph_runtime_buffers(
                         workspace,
                         bs,
@@ -1368,11 +1664,14 @@ class B12xAttnBackend(AttentionBackend):
                         page_table=layer_page_table,
                         cu_seqlens_q=cu_seqlens_q,
                     )
-                    if (
-                        getattr(workspace, "_decode_graph_chunk_pages_lut", None)
-                        is not None
-                    ):
-                        workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+                    if metadata_source is not workspace:
+                        self._bind_decode_graph_runtime_buffers(
+                            metadata_source,
+                            bs,
+                            cache_seqlens=cache_seqlens,
+                            page_table=layer_page_table,
+                            cu_seqlens_q=cu_seqlens_q,
+                        )
                 else:
                     workspace.update_prefill_graph_replay_metadata(
                         layer_page_table,
@@ -1380,6 +1679,190 @@ class B12xAttnBackend(AttentionBackend):
                         cu_seqlens_q,
                         window_left=window_left,
                     )
+        if mode == "decode":
+            prepare_plan = _DecodeGraphPreparePlan(
+                metadata_sources=tuple(decode_metadata_sources.values())
+            )
+            self.cuda_graph_prepare_plans[graph_key] = prepare_plan
+            if reset_decode_preprocess_capture:
+                self._reset_decode_graph_metadata_capture(graph_key)
+            if not decode_preprocess_in_graph:
+                self._update_decode_graph_prepare_plan(
+                    prepare_plan,
+                    req_pool_indices=req_pool_indices,
+                    decode_page_table_prebuilt=decode_page_table_prebuilt,
+                )
+
+    def _update_decode_graph_prepare_plan(
+        self,
+        prepare_plan: _DecodeGraphPreparePlan,
+        *,
+        req_pool_indices: torch.Tensor | None,
+        decode_page_table_prebuilt: bool,
+    ) -> None:
+        decode_page_table_ready = decode_page_table_prebuilt
+        for metadata_source in prepare_plan.metadata_sources:
+            if getattr(metadata_source, "_decode_graph_chunk_pages_lut", None) is None:
+                continue
+            if getattr(metadata_source, "_decode_graph_metadata_captured_in_graph", False):
+                continue
+            if decode_page_table_ready:
+                metadata_source.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+                continue
+            if req_pool_indices is None:
+                raise RuntimeError(
+                    "decode graph replay metadata update requires req_pool_indices"
+                )
+            metadata_source.update_decode_graph_replay_metadata(
+                req_to_token=self.req_to_token,
+                req_pool_indices=req_pool_indices,
+            )
+            decode_page_table_ready = True
+
+    def _decode_graph_metadata_key(
+        self,
+        graph_key: tuple[object, ...],
+        layer: RadixAttention,
+        *,
+        window_left: int,
+    ) -> tuple[object, ...]:
+        return (
+            *graph_key,
+            "decode-metadata",
+            bool(self._layer_uses_sliding_window_kv_pool(layer)),
+            int(layer.tp_q_head_num),
+            int(layer.tp_k_head_num),
+            int(layer.qk_head_dim),
+            int(layer.v_head_dim),
+            int(window_left),
+            self._num_cache_pages_for_layer(layer),
+        )
+
+    def _decode_graph_metadata_source(
+        self,
+        md: B12xForwardMetadata,
+        layer: RadixAttention,
+        *,
+        window_left: int,
+    ) -> PagedAttentionWorkspace | None:
+        if md.graph_key is None:
+            return None
+        metadata_key = self._decode_graph_metadata_key(
+            md.graph_key,
+            layer,
+            window_left=window_left,
+        )
+        return self.cuda_graph_decode_metadata_sources.get(metadata_key)
+
+    def _workspace_shares_decode_graph_metadata(
+        self,
+        workspace: PagedAttentionWorkspace,
+        source: PagedAttentionWorkspace,
+    ) -> bool:
+        for attr in _DECODE_GRAPH_METADATA_BUFFER_ATTRS:
+            workspace_tensor = getattr(workspace, attr, None)
+            source_tensor = getattr(source, attr, None)
+            if workspace_tensor is None or source_tensor is None:
+                return False
+            if int(workspace_tensor.data_ptr()) != int(source_tensor.data_ptr()):
+                return False
+        return True
+
+    def _decode_graph_prepare_plan_metadata_captured(
+        self,
+        graph_key: tuple[object, ...],
+    ) -> bool:
+        prepare_plan = getattr(self, "cuda_graph_prepare_plans", {}).get(graph_key)
+        if prepare_plan is None or not prepare_plan.metadata_sources:
+            return False
+        return all(
+            getattr(source, "_decode_graph_metadata_captured_in_graph", False)
+            for source in prepare_plan.metadata_sources
+        )
+
+    def _reset_decode_graph_metadata_capture(
+        self,
+        graph_key: tuple[object, ...],
+    ) -> None:
+        for key, workspace in self.cuda_graph_workspaces.items():
+            if key[: len(graph_key)] == graph_key:
+                workspace._decode_graph_metadata_captured_in_graph = False
+        prepare_plan = self.cuda_graph_prepare_plans.get(graph_key)
+        if prepare_plan is None:
+            return
+        for source in prepare_plan.metadata_sources:
+            source._decode_graph_metadata_captured_in_graph = False
+
+    def _ensure_decode_graph_metadata_source(
+        self,
+        workspace: PagedAttentionWorkspace,
+        metadata_key: tuple[object, ...],
+    ) -> PagedAttentionWorkspace:
+        source = self.cuda_graph_decode_metadata_sources.get(metadata_key)
+        if source is not None:
+            self._share_decode_graph_metadata_buffers(workspace, source)
+            return source
+
+        if self._decode_graph_metadata_source_conflicts(workspace):
+            self._replace_decode_graph_metadata_buffers(workspace)
+        self.cuda_graph_decode_metadata_sources[metadata_key] = workspace
+        return workspace
+
+    def _decode_graph_metadata_source_conflicts(
+        self,
+        workspace: PagedAttentionWorkspace,
+    ) -> bool:
+        workspace_ptrs = self._decode_graph_metadata_buffer_ptrs(workspace)
+        if not workspace_ptrs:
+            return False
+        for source in self.cuda_graph_decode_metadata_sources.values():
+            source_ptrs = self._decode_graph_metadata_buffer_ptrs(source)
+            if workspace_ptrs.intersection(source_ptrs):
+                return True
+        return False
+
+    def _decode_graph_metadata_buffer_ptrs(
+        self,
+        workspace: PagedAttentionWorkspace,
+    ) -> set[int]:
+        ptrs = set()
+        for attr in _DECODE_GRAPH_METADATA_BUFFER_ATTRS:
+            tensor = getattr(workspace, attr)
+            if tensor is not None:
+                ptrs.add(int(tensor.data_ptr()))
+        return ptrs
+
+    def _replace_decode_graph_metadata_buffers(
+        self,
+        workspace: PagedAttentionWorkspace,
+    ) -> None:
+        for attr in _DECODE_GRAPH_METADATA_BUFFER_ATTRS:
+            tensor = getattr(workspace, attr)
+            if tensor is None:
+                raise RuntimeError(
+                    f"decode graph workspace is missing {attr} metadata buffer"
+                )
+            setattr(workspace, attr, torch.empty_like(tensor))
+
+    def _share_decode_graph_metadata_buffers(
+        self,
+        workspace: PagedAttentionWorkspace,
+        source: PagedAttentionWorkspace,
+    ) -> None:
+        for attr in _DECODE_GRAPH_METADATA_BUFFER_ATTRS:
+            source_tensor = getattr(source, attr)
+            if source_tensor is None:
+                raise RuntimeError(
+                    f"decode graph metadata source is missing {attr} buffer"
+                )
+            setattr(workspace, attr, source_tensor)
+        workspace._decode_graph_chunk_pages_lut = source._decode_graph_chunk_pages_lut
+        workspace._decode_graph_max_chunks_per_req = (
+            source._decode_graph_max_chunks_per_req
+        )
+        workspace._use_regular_decode_graph_replay = (
+            source._use_regular_decode_graph_replay
+        )
 
     def _captured_graph_total_q_capacity(
         self, graph_key: tuple[object, ...]
@@ -1565,6 +2048,38 @@ class B12xAttnBackend(AttentionBackend):
             )
         return tokens_per_req
 
+    def _active_total_q_from_forward_batch(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        mode: str,
+    ) -> int:
+        if mode == "decode":
+            return int(bs)
+        if mode == "verify" and forward_batch.extend_seq_lens is None:
+            return int(bs) * self._target_verify_tokens_per_req(forward_batch)
+
+        extend_num_tokens = getattr(forward_batch, "extend_num_tokens", None)
+        if extend_num_tokens is not None:
+            return int(extend_num_tokens)
+
+        extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if extend_seq_lens_cpu is not None:
+            return int(sum(extend_seq_lens_cpu[:bs]))
+
+        return int(forward_batch.seq_lens_sum)
+
+    def _cuda_graph_total_q_hint_from_host(
+        self,
+        *,
+        bs: int,
+        seq_lens_sum: int,
+        spec_info: Optional[SpecInput],
+    ) -> int:
+        if spec_info is not None and hasattr(spec_info, "draft_token_num"):
+            return int(bs) * int(spec_info.draft_token_num)
+        return int(seq_lens_sum)
+
     def _build_cache_seqlens(
         self,
         forward_batch: ForwardBatch,
@@ -1644,6 +2159,7 @@ class B12xAttnBackend(AttentionBackend):
             page_table,
             swa_page_table,
             bs,
+            max_pages=page_table.shape[1],
         )
         return cache_seqlens, page_table, swa_page_table, cu_seqlens_q
 
@@ -1653,32 +2169,84 @@ class B12xAttnBackend(AttentionBackend):
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        build_page_table: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
         assert self.cuda_graph_cu_seqlens_q is not None
         assert self.cuda_graph_cache_seqlens is not None
         assert self.cuda_graph_page_table is not None
 
         cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
-        cache_seqlens.copy_(seq_lens[:bs].to(torch.int32))
         cu_seqlens_q = self.cuda_graph_cu_seqlens_q[: bs + 1]
-        cu_seqlens_q.copy_(
-            torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
-        )
         page_table = self.cuda_graph_page_table[:bs]
         swa_page_table = (
             self.cuda_graph_swa_page_table[:bs]
             if self.cuda_graph_swa_page_table is not None
             else None
         )
-        self._build_page_tables_into(
-            req_pool_indices[:bs],
-            cache_seqlens,
-            page_table,
-            swa_page_table,
-            bs,
-            max_pages=page_table.shape[1],
-        )
+        if build_page_table:
+            swa_index_mapping = (
+                None
+                if swa_page_table is None
+                else getattr(self.swa_kv_pool, "full_to_swa_index_mapping", None)
+            )
+            can_stage_with_b12x = (
+                page_table.device.type == "cuda"
+                and req_pool_indices.device.type == "cuda"
+                and seq_lens.device.type == "cuda"
+                and self.req_to_token.device.type == "cuda"
+                and (swa_page_table is None or swa_index_mapping is not None)
+            )
+            if not can_stage_with_b12x:
+                cache_seqlens.copy_(seq_lens[:bs].to(torch.int32))
+                cu_seqlens_q.copy_(
+                    torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
+                )
+                self._build_page_tables_into(
+                    req_pool_indices[:bs],
+                    cache_seqlens,
+                    page_table,
+                    swa_page_table,
+                    bs,
+                    max_pages=page_table.shape[1],
+                )
+            else:
+                from b12x.attention.paged.graph_replay import (
+                    stage_decode_cuda_graph_metadata,
+                )
+
+                stage_decode_cuda_graph_metadata(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices[:bs],
+                    seq_lens=seq_lens[:bs],
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    page_table=page_table,
+                    swa_page_table=swa_page_table,
+                    swa_index_mapping=swa_index_mapping,
+                    page_size=self.page_size,
+                )
+        else:
+            cache_seqlens.copy_(seq_lens[:bs].to(torch.int32))
+            cu_seqlens_q.copy_(
+                torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
+            )
         return cache_seqlens, page_table, swa_page_table, cu_seqlens_q
+
+    def _decode_cuda_graph_metadata_views(
+        self,
+        bs: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        assert self.cuda_graph_cu_seqlens_q is not None
+        assert self.cuda_graph_cache_seqlens is not None
+        assert self.cuda_graph_page_table is not None
+        return (
+            self.cuda_graph_cache_seqlens[:bs],
+            self.cuda_graph_page_table[:bs],
+            self.cuda_graph_swa_page_table[:bs]
+            if self.cuda_graph_swa_page_table is not None
+            else None,
+            self.cuda_graph_cu_seqlens_q[: bs + 1],
+        )
 
     def _validate_layer_contract(self, layer: RadixAttention) -> None:
         if layer.tp_q_head_num <= 0 or layer.tp_k_head_num <= 0:
@@ -1698,31 +2266,6 @@ class B12xAttnBackend(AttentionBackend):
                 f"got qk={layer.qk_head_dim}, v={layer.v_head_dim}; "
                 f"expected qk={expected_qk}, v={expected_v}"
             )
-
-    def _validate_kv_cache_dtype_contract(self) -> None:
-        if self.kv_cache_dtype != torch.float8_e4m3fn:
-            return
-
-        unsupported_layers = [
-            (
-                int(layer.layer_id),
-                int(layer.qk_head_dim),
-                int(layer.v_head_dim),
-            )
-            for layer in self.attention_layers
-            if (int(layer.qk_head_dim), int(layer.v_head_dim))
-            not in ((256, 256), (192, 128))
-        ]
-        if not unsupported_layers:
-            return
-
-        layer_id, qk_head_dim, v_head_dim = unsupported_layers[0]
-        raise ValueError(
-            "b12x FP8 KV cache decode currently requires qk/v head dims "
-            "256/256 or 192/128; got "
-            f"qk={qk_head_dim}, v={v_head_dim} on layer {layer_id}. "
-            "Use --kv-cache-dtype bfloat16 for this model."
-        )
 
     def _prime_graph_workspace_capacity(
         self,

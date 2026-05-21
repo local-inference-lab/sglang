@@ -146,7 +146,21 @@ def _requires_b12x_joint_moe_pool() -> bool:
         server_args.nsa_prefill_backend == "b12x"
         or server_args.nsa_decode_backend == "b12x"
     )
-    return uses_b12x_paged_attention or (uses_nsa_attention and uses_b12x_nsa)
+    backend_names = {
+        str(prefill_backend).lower(),
+        str(decode_backend).lower(),
+        str(getattr(server_args, "attention_backend", "")).lower(),
+    }
+    model_hint = str(getattr(server_args, "model_path", "")).lower()
+    uses_deepseek_v4 = any(
+        "deepseek_v4" in name or "deepseekv4" in name or "dsv4" in name
+        for name in backend_names
+    ) or ("deepseek" in model_hint and "v4" in model_hint)
+    return (
+        uses_b12x_paged_attention
+        or (uses_nsa_attention and uses_b12x_nsa)
+        or uses_deepseek_v4
+    )
 
 
 def _get_b12x_workspace_pool(device: torch.device):
@@ -2395,6 +2409,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     device=x.device,
                 )
             workspace_pool = _get_b12x_workspace_pool(x.device)
+            swiglu_limit = moe_runner_config.swiglu_limit
+            quant_mode = "w4a16" if swiglu_limit is not None else "nvfp4"
 
             output = b12x_moe_fp4(
                 a=x,
@@ -2409,10 +2425,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=activation,
+                quant_mode=quant_mode,
+                source_format="modelopt",
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
                 workspace=workspace_pool,
                 output=symm_output,
                 input_scales_static=True,
+                swiglu_limit=swiglu_limit,
             ).to(x.dtype)
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
             return StandardCombineInput(hidden_states=output)

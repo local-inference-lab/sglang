@@ -216,6 +216,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "b12x",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -5579,7 +5580,8 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). ",
+            "'aiter' (ROCm only), "
+            "'b12x' (SM120 native block-FP8 GEMM for b12x integrations). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",

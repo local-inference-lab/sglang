@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -20,6 +21,7 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.b12x_backend import _b12x_get_config_attr
 from sglang.srt.layers.attention.dsv4.compressor import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -40,15 +42,15 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
+    get_attention_tp_size,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
-
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -57,9 +59,30 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+B12X_COMPRESSED_MLA_HEAD_DIM = 512
+B12X_C4_INDEXER_TILE_BLOCK_K = 512
+B12X_C4_INDEXER_SUPERTILE_K_ENV = "B12X_PAGED_MQA_INDEX_SUPERTILE_K"
+B12X_C4_INDEXER_SUPERTILE_K_DEFAULT = 1048576
+B12X_C4_INDEXER_UNSCHEDULED_MAX_PAGES = 1023
+B12X_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES_ENV = (
+    "B12X_DSV4_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES"
+)
+B12X_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES_DEFAULT = 2 * 1024 * 1024 * 1024
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
+
+
+@dataclass
+class _B12XCompressedMLABundle:
+    arena: object
+    workspaces: Dict[Tuple[object, ...], object]
+    mhc_workspace: object | None = None
+
+
+_global_b12x_compressed_mla_bundles: Dict[
+    Tuple[object, ...], _B12XCompressedMLABundle
+] = {}
 
 
 def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -70,10 +93,10 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
 
 
-def _create_flashmla_metadata():
-    import flash_mla
-
-    return flash_mla.get_mla_metadata()[0]
+def _same_device(actual: torch.device, expected: torch.device) -> bool:
+    if actual.type != expected.type:
+        return False
+    return expected.index is None or actual.index == expected.index
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -103,24 +126,11 @@ class DSV4AttnMetadata:
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
-
-    c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
-    c4_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
-    c128_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
+    c128_index_capacity: Optional[int] = None
 
     @property
     def positions(self) -> torch.Tensor:
         return self.positions_casual
-
-    def get_flashmla_metadata(self, compress_ratio: Literal[0, 4, 128]):
-        if compress_ratio == 0:
-            return self.c1_flashmla_metadata
-        elif compress_ratio == 4:
-            return self.c4_flashmla_metadata
-        elif compress_ratio == 128:
-            return self.c128_flashmla_metadata
-        else:
-            raise ValueError(f"invalid {compress_ratio=}")
 
     def copy_(self, other: DSV4AttnMetadata) -> None:
         copy_metadata(
@@ -130,6 +140,7 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk",
                 "page_size",
                 "cuda_int32_kwargs",
+                "c128_index_capacity",
             ],
             copy_fields=[
                 "raw_out_loc",
@@ -146,11 +157,6 @@ class DSV4AttnMetadata:
                 "c4_topk_lengths_clamp1",
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
-            ],
-            assign_fields=[
-                "c1_flashmla_metadata",
-                "c4_flashmla_metadata",
-                "c128_flashmla_metadata",
             ],
         )
 
@@ -176,6 +182,7 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            max_c128_page_indices=self.c128_index_capacity,
         )
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
@@ -230,7 +237,7 @@ class DSV4AttnMetadata:
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
 
-    def init_flashmla_related(self):
+    def init_sparse_mla_related(self):
         # c4_sparse_topk is set from model_config.index_topk per-model
         # (small model: 512, large model: 1024).
         assert self.c4_sparse_topk in (512, 1024), (
@@ -248,9 +255,6 @@ class DSV4AttnMetadata:
             device=self.c4_topk_lengths_clamp1.device,
         )
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
-        self.c1_flashmla_metadata = _create_flashmla_metadata()
-        self.c4_flashmla_metadata = _create_flashmla_metadata()
-        self.c128_flashmla_metadata = _create_flashmla_metadata()
 
 
 @dataclass
@@ -331,6 +335,9 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.device = torch.device(model_runner.device)
+        self.server_args = model_runner.server_args
+        self.max_running_requests = int(getattr(model_runner, "max_running_requests", 1))
+        self.q_dtype = model_runner.dtype
         head_dim = model_runner.model_config.head_dim
         assert (
             head_dim == 512
@@ -349,16 +356,44 @@ class DeepseekV4AttnBackend(
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.c4_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+        self.hf_text_config = model_runner.model_config.hf_text_config
+        self.c4_topk = getattr(self.hf_text_config, "index_topk", C4_TOPK)
+        architectures = tuple(
+            str(architecture)
+            for architecture in getattr(model_runner.model_config.hf_config, "architectures", ())
         )
+        self._b12x_is_nextn_model = any("NextN" in architecture for architecture in architectures)
+        self.attn_tp_size = get_attention_tp_size()
+        model_config_total_q_heads = getattr(
+            model_runner.model_config, "num_attention_heads", None
+        )
+        total_q_heads = int(
+            getattr(self.hf_text_config, "num_attention_heads", model_config_total_q_heads)
+        )
+        index_total_q_heads = int(
+            getattr(self.hf_text_config, "index_n_heads", total_q_heads)
+        )
+        if total_q_heads % self.attn_tp_size != 0:
+            raise ValueError(
+                f"num_attention_heads={total_q_heads} must divide by TP={self.attn_tp_size}"
+            )
+        if index_total_q_heads <= 0:
+            raise ValueError(
+                f"index_n_heads must be positive, got {index_total_q_heads}"
+            )
+        self.num_q_heads = total_q_heads // self.attn_tp_size
+        self.index_num_q_heads = index_total_q_heads
+        self._b12x_compressed_workspaces = {}
+        self._b12x_indexer_workspaces = {}
+        self._b12x_attention_bundle: Optional[_B12XCompressedMLABundle] = None
+        self._use_prep_in_cuda_graph = False
 
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = self.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = (
-            model_runner.server_args.speculative_num_draft_tokens
+            self.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
@@ -367,16 +402,1010 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
+        self._init_b12x_attention_bundle(model_runner)
+
+    def _b12x_graph_batch_counts(self) -> Tuple[int, ...]:
+        candidates = [self.max_running_requests]
+        cuda_graph_max_bs = getattr(self.server_args, "cuda_graph_max_bs", None)
+        if cuda_graph_max_bs is not None:
+            candidates.append(int(cuda_graph_max_bs))
+        cuda_graph_bs = getattr(self.server_args, "cuda_graph_bs", None)
+        if cuda_graph_bs:
+            candidates.extend(int(bs) for bs in cuda_graph_bs)
+        return tuple(sorted({int(value) for value in candidates if int(value) > 0}))
+
+    def _b12x_graph_batch_capacity(self) -> int:
+        return max(1, *self._b12x_graph_batch_counts())
+
+    def _b12x_graph_q_rows_counts(self) -> Tuple[int, ...]:
+        draft_tokens = max(1, int(self.speculative_num_draft_tokens or 1))
+        counts = self._b12x_graph_batch_counts()
+        if not counts:
+            counts = (1,)
+        return tuple(max(1, int(count) * draft_tokens) for count in counts)
+
+    def _b12x_graph_q_rows_capacity(self) -> int:
+        return max(1, *self._b12x_graph_q_rows_counts())
+
+    def _b12x_compression_ratios(self) -> Tuple[int, ...]:
+        ratios = getattr(self.token_to_kv_pool, "compression_ratios", None)
+        if ratios is None:
+            ratios = getattr(self.hf_text_config, "compress_ratios", ())
+        return tuple(int(ratio) for ratio in ratios)
+
+    def _b12x_uses_c4_attention(self) -> bool:
+        return any(ratio == 4 for ratio in self._b12x_compression_ratios())
+
+    def _b12x_first_c4_layer_id(self) -> int:
+        for layer_id, ratio in enumerate(self._b12x_compression_ratios()):
+            if ratio == 4:
+                return layer_id
+        raise RuntimeError("b12x C4 indexer requested but no C4 layer is present")
+
+    def _b12x_uses_c128_attention(self) -> bool:
+        return any(ratio == 128 for ratio in self._b12x_compression_ratios())
+
+    def _b12x_uses_compressed_attention(self) -> bool:
+        return self._b12x_uses_c4_attention() or self._b12x_uses_c128_attention()
+
+    def _b12x_prefill_budget_selected_widths(self) -> Tuple[int, ...]:
+        widths = set(self._b12x_compressed_selected_widths())
+        if self._b12x_is_nextn_model and not self._b12x_uses_compressed_attention():
+            swa_width = ceil_align(SWA_WINDOW, PAGE_INDEX_ALIGNED_SIZE)
+            c4_width = ceil_align(self.c4_topk, PAGE_INDEX_ALIGNED_SIZE)
+            widths.add(swa_width + c4_width)
+        return tuple(sorted(widths))
+
+    def _b12x_prefill_budget_split_chunk_capacity(self) -> int:
+        from b12x.integration.mla import compressed_mla_split_chunks_for_contract
+
+        max_chunks = 1
+        rows = self._b12x_eager_extend_total_q_capacity()
+        for selected_width in self._b12x_prefill_budget_selected_widths():
+            max_chunks = max(
+                max_chunks,
+                compressed_mla_split_chunks_for_contract(
+                    rows=rows,
+                    width=selected_width,
+                ),
+            )
+        return max_chunks
+
+    def _b12x_eager_extend_total_q_capacity(self) -> int:
+        chunked_prefill_size = int(
+            getattr(self.server_args, "chunked_prefill_size", -1) or -1
+        )
+        if chunked_prefill_size > 0:
+            return chunked_prefill_size
+        raise RuntimeError(
+            "b12x DeepSeek V4 prefill requires --chunked-prefill-size > 0. "
+            "Without chunking, eager prefill would need a max-prefill-token "
+            "compressed MLA workspace and cannot reuse the fixed chunk workspace."
+        )
+
+    def _b12x_compressed_prefill_q_capacity(self) -> int:
+        chunk_capacity = self._b12x_eager_extend_total_q_capacity()
+        override = os.environ.get("B12X_COMPRESSED_MLA_PREFILL_Q_CAP")
+        if override is not None:
+            q_capacity = int(override)
+            if q_capacity <= 0:
+                raise RuntimeError(
+                    "B12X_COMPRESSED_MLA_PREFILL_Q_CAP must be positive when set"
+                )
+            return max(1, min(chunk_capacity, q_capacity))
+
+        budget_gib = float(
+            os.environ.get("B12X_COMPRESSED_MLA_PREFILL_WORKSPACE_GIB", "2.0")
+        )
+        if budget_gib <= 0:
+            raise RuntimeError(
+                "B12X_COMPRESSED_MLA_PREFILL_WORKSPACE_GIB must be positive"
+            )
+        selected_width = max(self._b12x_prefill_budget_selected_widths())
+        max_chunks_per_row = self._b12x_prefill_budget_split_chunk_capacity()
+        row_nbytes = (
+            3 * 4
+            + self.num_q_heads * max_chunks_per_row * self.head_dim_v * 2
+            + self.num_q_heads * max_chunks_per_row * 4
+        )
+        q_capacity = int((budget_gib * (1 << 30)) // max(row_nbytes, 1))
+        q_capacity = max(1, min(chunk_capacity, q_capacity))
+        if q_capacity >= 128:
+            q_capacity = (q_capacity // 128) * 128
+        return max(1, q_capacity)
+
+    def _b12x_prefill_q_capacity(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        q_rows: int,
+    ) -> Optional[int]:
+        if not forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+            return None
+        q_capacity = self._b12x_eager_extend_total_q_capacity()
+        if int(q_rows) > q_capacity:
+            raise RuntimeError(
+                "b12x DeepSeek V4 prefill received a chunk larger than the fixed "
+                f"workspace capacity: q_rows={int(q_rows)}, "
+                f"chunked_prefill_size={q_capacity}. Check that SGLang chunked "
+                "prefill is enabled and that the chunk size matches the b12x "
+                "workspace capacity."
+            )
+        return q_capacity
+
+    def _b12x_compressed_selected_widths(self) -> Tuple[int, ...]:
+        swa_width = ceil_align(SWA_WINDOW, PAGE_INDEX_ALIGNED_SIZE)
+        widths = {swa_width}
+        if self._b12x_uses_c4_attention():
+            widths.add(swa_width + ceil_align(self.c4_topk, PAGE_INDEX_ALIGNED_SIZE))
+        if self._b12x_uses_c128_attention():
+            widths.add(swa_width + self._b12x_c128_index_width_capacity())
+        return tuple(sorted(widths))
+
+    def _b12x_compressed_selected_width_capacity(self) -> int:
+        return max(self._b12x_compressed_selected_widths())
+
+    def _b12x_full_token_capacity(self) -> int:
+        candidates = [max(1, int(self.MAX_SEQ_LEN_FOR_CAPTURE))]
+        c128_size = int(getattr(self.token_to_kv_pool, "c128_size", 0) or 0)
+        if c128_size > 0:
+            candidates.append(c128_size * 128)
+        c4_logical_size = int(
+            getattr(self.token_to_kv_pool, "c4_logical_size", 0) or 0
+        )
+        if c4_logical_size > 0:
+            candidates.append(c4_logical_size * 4)
+        return max(1, min(candidates))
+
+    def _b12x_c128_index_width_capacity(self) -> int:
+        if not self._b12x_uses_c128_attention():
+            return 0
+        full_token_capacity = self._b12x_full_token_capacity()
+        c128_width = (full_token_capacity + 127) // 128
+        c128_pool_size = int(getattr(self.token_to_kv_pool, "c128_size", 0) or 0)
+        if c128_pool_size > 0:
+            c128_width = min(c128_width, c128_pool_size)
+        return ceil_align(c128_width, PAGE_INDEX_ALIGNED_SIZE)
+
+    def _b12x_split_chunk_capacity(self) -> int:
+        max_chunks = 1
+        for selected_width in self._b12x_compressed_selected_widths():
+            max_chunks = max(
+                max_chunks,
+                self._b12x_compressed_mla_split_chunks(
+                    q_rows=self._b12x_graph_q_rows_capacity(),
+                    selected_width=selected_width,
+                ),
+                self._b12x_compressed_mla_split_chunks(
+                    q_rows=self._b12x_compressed_prefill_q_capacity(),
+                    selected_width=selected_width,
+                ),
+            )
+        return max_chunks
+
+    def _b12x_compressed_mla_split_chunks(
+        self,
+        *,
+        q_rows: int,
+        selected_width: int,
+    ) -> int:
+        from b12x.integration.mla import compressed_mla_split_chunks_for_contract
+
+        return compressed_mla_split_chunks_for_contract(
+            rows=max(int(q_rows), 1),
+            width=max(int(selected_width), 1),
+        )
+
+    def _b12x_compressed_mla_max_q_chunks_capacity(
+        self,
+        *,
+        graph_q_rows: int,
+        compressed_prefill_q: int,
+        selected_widths: Tuple[int, ...],
+    ) -> int:
+        max_q_chunks = 1
+        for selected_width in selected_widths:
+            for q_rows in (graph_q_rows, compressed_prefill_q):
+                max_q_chunks = max(
+                    max_q_chunks,
+                    max(int(q_rows), 1)
+                    * self._b12x_compressed_mla_split_chunks(
+                        q_rows=q_rows,
+                        selected_width=selected_width,
+                    ),
+                )
+        return max_q_chunks
+
+    def _b12x_indexer_page_table_width_capacity(self) -> int:
+        if not self._b12x_uses_c4_attention():
+            return 1
+        capture_width = (
+            int(self.MAX_SEQ_LEN_FOR_CAPTURE) + int(self.page_size) - 1
+        ) // int(self.page_size)
+        return ceil_align(
+            max(
+                capture_width,
+                (self._b12x_full_token_capacity() + self.page_size - 1)
+                // self.page_size,
+            ),
+            PAGE_INDEX_ALIGNED_SIZE,
+        )
+
+    def _b12x_c4_indexer_supertile_tokens_capacity(
+        self,
+        *,
+        page_table_width: Optional[int] = None,
+        q_rows: Optional[int] = None,
+    ) -> int:
+        if not self._b12x_uses_c4_attention():
+            return 0
+        if page_table_width is None:
+            page_table_width = self._b12x_indexer_page_table_width_capacity()
+        c4_page_size = self.page_size // 4
+        max_tokens = max(1, int(page_table_width) * c4_page_size)
+
+        requested = int(
+            os.environ.get(
+                B12X_C4_INDEXER_SUPERTILE_K_ENV,
+                str(B12X_C4_INDEXER_SUPERTILE_K_DEFAULT),
+            )
+        )
+        if requested <= 0:
+            raise RuntimeError(
+                f"{B12X_C4_INDEXER_SUPERTILE_K_ENV} must be positive when set"
+            )
+        requested = ceil_align(requested, B12X_C4_INDEXER_TILE_BLOCK_K)
+
+        budget_bytes = int(
+            os.environ.get(
+                B12X_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES_ENV,
+                str(B12X_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES_DEFAULT),
+            )
+        )
+        if budget_bytes <= 0:
+            raise RuntimeError(
+                f"{B12X_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES_ENV} must be positive when set"
+            )
+        if q_rows is None:
+            q_rows = max(
+                self._b12x_graph_q_rows_capacity(),
+                self._b12x_eager_extend_total_q_capacity(),
+            )
+        q_rows_aligned = ceil_align(max(int(q_rows), 1), 32)
+        budget_tokens = budget_bytes // max(q_rows_aligned * 4, 1)
+        budget_tokens = (
+            budget_tokens // B12X_C4_INDEXER_TILE_BLOCK_K
+        ) * B12X_C4_INDEXER_TILE_BLOCK_K
+        if budget_tokens < B12X_C4_INDEXER_TILE_BLOCK_K:
+            raise RuntimeError(
+                "b12x DeepSeek V4 C4 indexer tile-logits budget is too small: "
+                f"budget_bytes={budget_bytes}, q_rows_aligned={q_rows_aligned}"
+            )
+
+        # The current C4 windowed scorer intentionally uses the unscheduled
+        # paged path so it can consume the live full page table directly under
+        # graph capture. Keep the fixed supertile below b12x's paged-schedule
+        # threshold for every captured q_rows contract.
+        unscheduled_tokens = B12X_C4_INDEXER_UNSCHEDULED_MAX_PAGES * c4_page_size
+        unscheduled_tokens = (
+            unscheduled_tokens // B12X_C4_INDEXER_TILE_BLOCK_K
+        ) * B12X_C4_INDEXER_TILE_BLOCK_K
+        supertile_tokens = min(
+            requested,
+            max_tokens,
+            budget_tokens,
+            unscheduled_tokens,
+        )
+        supertile_tokens = (
+            supertile_tokens // B12X_C4_INDEXER_TILE_BLOCK_K
+        ) * B12X_C4_INDEXER_TILE_BLOCK_K
+        return max(B12X_C4_INDEXER_TILE_BLOCK_K, supertile_tokens)
+
+    def _b12x_c4_indexer_supertile_pages_capacity(
+        self,
+        *,
+        page_table_width: Optional[int] = None,
+        q_rows: Optional[int] = None,
+    ) -> int:
+        if not self._b12x_uses_c4_attention():
+            return 1
+        c4_page_size = self.page_size // 4
+        return max(
+            1,
+            self._b12x_c4_indexer_supertile_tokens_capacity(
+                page_table_width=page_table_width,
+                q_rows=q_rows,
+            )
+            // c4_page_size,
+        )
+
+    def _build_b12x_attention_arena_caps(self):
+        from b12x.integration.mla import B12XAttentionArenaCaps
+
+        graph_q_rows = self._b12x_graph_q_rows_capacity()
+        prefill_chunk_q = self._b12x_eager_extend_total_q_capacity()
+        compressed_prefill_q = self._b12x_compressed_prefill_q_capacity()
+        selected_widths = self._b12x_compressed_selected_widths()
+        selected_width = self._b12x_compressed_selected_width_capacity()
+        indexer_topk = (
+            ceil_align(self.c4_topk, PAGE_INDEX_ALIGNED_SIZE)
+            if self._b12x_uses_c4_attention()
+            else 1
+        )
+        page_table_width = self._b12x_indexer_page_table_width_capacity()
+        c4_supertile_tokens = self._b12x_c4_indexer_supertile_tokens_capacity(
+            page_table_width=page_table_width,
+            q_rows=max(graph_q_rows, prefill_chunk_q),
+        )
+        c4_dense_decode_tokens = page_table_width * 64 if self._b12x_uses_c4_attention() else 0
+        max_chunks_per_row = self._b12x_split_chunk_capacity()
+        mla_max_q_chunks = self._b12x_compressed_mla_max_q_chunks_capacity(
+            graph_q_rows=graph_q_rows,
+            compressed_prefill_q=compressed_prefill_q,
+            selected_widths=selected_widths,
+        )
+        logger.info(
+            "b12x DeepSeek V4 attention arena caps: "
+            "full_token_capacity=%s selected_widths=%s indexer_topk=%s "
+            "indexer_page_table_width=%s max_chunks_per_row=%s mla_q_chunks=%s "
+            "prefill_chunk_q=%s compressed_prefill_q=%s "
+            "c4_indexer_supertile_tokens=%s c4_dense_decode_q=%s "
+            "c4_dense_decode_tokens=%s mhc_tokens=%s",
+            self._b12x_full_token_capacity(),
+            list(selected_widths),
+            indexer_topk,
+            page_table_width,
+            max_chunks_per_row,
+            mla_max_q_chunks,
+            prefill_chunk_q,
+            compressed_prefill_q,
+            c4_supertile_tokens,
+            graph_q_rows,
+            c4_dense_decode_tokens,
+            max(graph_q_rows, prefill_chunk_q),
+        )
+        return B12XAttentionArenaCaps(
+            device=self.device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=self.num_q_heads,
+            indexer_num_q_heads=self.index_num_q_heads,
+            head_dim=B12X_COMPRESSED_MLA_HEAD_DIM,
+            max_v_head_dim=self.head_dim_v,
+            topk=selected_width,
+            indexer_topk=indexer_topk,
+            max_page_table_width=page_table_width,
+            extend_max_total_q=compressed_prefill_q,
+            extend_max_batch=compressed_prefill_q,
+            extend_max_kv_rows=0,
+            indexer_max_k_rows=c4_supertile_tokens,
+            paged_max_q_rows=max(graph_q_rows, prefill_chunk_q),
+            paged_max_batch=max(graph_q_rows, prefill_chunk_q),
+            mla_max_total_q=max(graph_q_rows, compressed_prefill_q),
+            mla_max_q_chunks=mla_max_q_chunks,
+            page_size=64,
+            max_chunks_per_row=max_chunks_per_row,
+            reserve_extend_indexer_logits=False,
+            reserve_paged_indexer_logits=self._b12x_uses_c4_attention(),
+            reserve_mhc=True,
+            mhc_max_tokens=max(graph_q_rows, prefill_chunk_q),
+            mhc_hidden_size=int(getattr(self.hf_text_config, "hidden_size")),
+            paged_indexer_logits_q_rows=graph_q_rows,
+            paged_indexer_logits_k_rows=c4_dense_decode_tokens,
+            paged_indexer_tile_logits_k_rows=c4_supertile_tokens,
+        )
+
+    def _build_b12x_moe_arena_caps(self, model_runner: ModelRunner):
+        from b12x.integration import B12XMoEArenaCaps
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+        from sglang.srt.layers.moe import get_moe_runner_backend
+
+        if not get_moe_runner_backend().is_b12x():
+            return None
+
+        cfg = model_runner.model_config.hf_config
+        weight_E = _b12x_get_config_attr(
+            cfg, ("n_routed_experts", "num_experts", "num_local_experts")
+        )
+        hidden_size = _b12x_get_config_attr(cfg, ("hidden_size",))
+        intermediate_size = _b12x_get_config_attr(
+            cfg, ("moe_intermediate_size", "intermediate_size")
+        )
+        num_topk = _b12x_get_config_attr(
+            cfg,
+            (
+                "num_experts_per_tok",
+                "top_k",
+                "num_experts_per_token",
+                "router_topk",
+            ),
+        )
+        missing = [
+            name
+            for name, value in (
+                ("n_routed_experts/num_experts/num_local_experts", weight_E),
+                ("hidden_size", hidden_size),
+                ("moe_intermediate_size/intermediate_size", intermediate_size),
+                (
+                    "num_experts_per_tok/top_k/num_experts_per_token/router_topk",
+                    num_topk,
+                ),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "b12x joint arena cannot size MoE workspace; missing config fields: "
+                + ", ".join(missing)
+            )
+
+        tp_size = max(1, int(get_tensor_model_parallel_world_size()))
+        intermediate_size = int(intermediate_size)
+        if intermediate_size % tp_size != 0:
+            raise ValueError(
+                "b12x joint arena expected MoE intermediate_size to be divisible "
+                f"by tensor parallel size, got intermediate_size={intermediate_size}, tp_size={tp_size}"
+            )
+        graph_q_rows_counts = self._b12x_graph_q_rows_counts()
+        graph_batch_counts = self._b12x_graph_batch_counts()
+        graph_q_rows = max(1, *graph_q_rows_counts)
+        extend_total_q = self._b12x_eager_extend_total_q_capacity()
+        max_tokens = max(extend_total_q, graph_q_rows)
+        small_graph_token_counts = range(1, graph_q_rows + 1)
+        core_token_counts = {
+            int(extend_total_q),
+            *(int(count) for count in graph_q_rows_counts),
+            # EAGLE draft graph capture can run the NextN MoE with raw graph
+            # batch counts rather than batch*draft_tokens. Keep those exact
+            # small launches preplanned so the frozen b12x MoE pool does not
+            # need to compile or allocate inside capture.
+            *(int(count) for count in graph_batch_counts),
+            # Runtime speculative verify/draft paths can also produce accepted
+            # token counts between the captured graph sizes. These are still a
+            # fixed graph-contract envelope, not live sequence-derived shapes.
+            *(int(count) for count in small_graph_token_counts),
+        }
+        return B12XMoEArenaCaps(
+            device=self.device,
+            dtype=self.q_dtype,
+            quant_mode="w4a16",
+            weight_E=int(weight_E),
+            k=int(hidden_size),
+            n=intermediate_size // tp_size,
+            num_topk=int(num_topk),
+            max_tokens=max_tokens,
+            core_token_counts=tuple(sorted(core_token_counts)),
+            route_num_experts=int(weight_E),
+            route_logits_dtype=self.q_dtype,
+            activation=str(getattr(cfg, "hidden_act", "silu")).lower(),
+            apply_router_weight_on_input=bool(
+                getattr(cfg, "moe_apply_router_weight_on_input", False)
+            ),
+            swiglu_limit=getattr(cfg, "swiglu_limit", None),
+        )
+
+    def _build_b12x_attention_bundle_key(self, caps) -> Tuple[object, ...]:
+        return (
+            caps.device,
+            caps.dtype,
+            caps.kv_dtype,
+            int(caps.num_q_heads),
+            int(caps.indexer_num_q_heads),
+            int(caps.head_dim),
+            int(caps.max_v_head_dim),
+            int(caps.topk),
+            int(getattr(caps, "indexer_topk", caps.topk)),
+            int(caps.max_page_table_width),
+            int(caps.extend_max_total_q),
+            int(caps.extend_max_batch),
+            int(caps.extend_max_kv_rows),
+            int(getattr(caps, "indexer_max_k_rows", 0) or 0),
+            int(caps.paged_max_q_rows),
+            int(caps.paged_max_batch),
+            int(getattr(caps, "mla_max_total_q", 0) or 0),
+            int(getattr(caps, "mla_max_q_chunks", 0) or 0),
+            int(caps.page_size),
+            int(caps.padded_heads),
+            int(caps.max_chunks_per_row),
+            bool(caps.reserve_extend_indexer_logits),
+            bool(caps.reserve_paged_indexer_logits),
+            bool(getattr(caps, "reserve_mhc", False)),
+            int(getattr(caps, "mhc_max_tokens", 0) or 0),
+            int(getattr(caps, "mhc_hidden_size", 0) or 0),
+            int(getattr(caps, "mhc_split_k", 0) or 0),
+            int(caps.extend_indexer_tile_logits_k_rows),
+            int(getattr(caps, "paged_indexer_logits_q_rows", 0) or 0),
+            int(caps.paged_indexer_logits_k_rows),
+            int(caps.paged_indexer_tile_logits_k_rows),
+        )
+
+    def _init_b12x_attention_bundle(self, model_runner: ModelRunner) -> None:
+        from b12x.integration import (
+            B12XJointArenaSpec,
+            ensure_b12x_execution_lane_arena,
+        )
+
+        if self._b12x_attention_bundle is not None:
+            return
+
+        caps = self._build_b12x_attention_arena_caps()
+        moe_caps = self._build_b12x_moe_arena_caps(model_runner)
+        lane = ensure_b12x_execution_lane_arena(
+            B12XJointArenaSpec(
+                device=self.device,
+                attention_caps=caps,
+                moe_caps=moe_caps,
+            )
+        )
+        if lane.arena is None or lane.arena.attention_arena is None:
+            raise RuntimeError("b12x execution lane was allocated without attention arena")
+        arena = lane.arena.attention_arena
+        bundle_key = self._build_b12x_attention_bundle_key(caps)
+        bundle = _global_b12x_compressed_mla_bundles.get(bundle_key)
+        if bundle is None:
+            bundle = _B12XCompressedMLABundle(arena=arena, workspaces={})
+            _global_b12x_compressed_mla_bundles[bundle_key] = bundle
+        elif bundle.arena is not arena:
+            raise RuntimeError(
+                "existing b12x compressed MLA bundle is not owned by the active execution lane"
+            )
+        self._b12x_attention_bundle = bundle
+        setattr(model_runner, "_dsv4_b12x_attention_bundle", bundle)
+        self._prime_b12x_default_fixed_workspaces()
+
+    def get_b12x_mhc_workspace(self):
+        if self._b12x_attention_bundle is None:
+            raise RuntimeError("b12x attention bundle is not initialized")
+        workspace = self._b12x_attention_bundle.mhc_workspace
+        if workspace is None:
+            workspace = self._b12x_attention_bundle.arena.make_mhc_workspace()
+            self._b12x_attention_bundle.mhc_workspace = workspace
+        return workspace
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
-    def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
+    def init_forward_metadata_indexer(
+        self,
+        core_attn_metadata: DSV4AttnMetadata,
+        *,
+        shared_page_table: bool = False,
+    ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            expected_num_q_heads=self.index_num_q_heads,
+            shared_page_table=shared_page_table,
+        )
+
+    def _use_b12x_fixed_workspace(self, forward_batch: ForwardBatch) -> bool:
+        return bool(forward_batch.forward_mode.is_cuda_graph() or get_is_capture_mode())
+
+    def get_b12x_compressed_mla_workspace(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        q_rows: int,
+        selected_width: int,
+    ):
+        fixed = self._use_b12x_fixed_workspace(forward_batch)
+        if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+            self._b12x_prefill_q_capacity(
+                forward_batch=forward_batch,
+                q_rows=q_rows,
+            )
+            compressed_q_capacity = self._b12x_compressed_prefill_q_capacity()
+            if int(q_rows) > compressed_q_capacity:
+                raise RuntimeError(
+                    "b12x DeepSeek V4 compressed MLA prefill must be sliced before "
+                    f"workspace lookup: q_rows={int(q_rows)}, "
+                    f"compressed_q_capacity={compressed_q_capacity}"
+                )
+            fixed = True
+            q_rows = compressed_q_capacity
+        return self._get_b12x_compressed_mla_workspace(
+            q_rows=q_rows,
+            selected_width=selected_width,
+            fixed=fixed,
+        )
+
+    def _get_b12x_compressed_mla_workspace(
+        self,
+        *,
+        q_rows: int,
+        selected_width: int,
+        fixed: bool,
+    ):
+        from b12x.integration.mla import (
+            B12XAttentionWorkspace,
+            B12XAttentionWorkspaceContract,
+        )
+
+        q_rows = max(int(q_rows), 1)
+        selected_width = max(int(selected_width), 1)
+        split_chunks = self._b12x_compressed_mla_split_chunks(
+            q_rows=q_rows,
+            selected_width=selected_width,
+        )
+        cache = self._b12x_compressed_workspaces
+        key = (
+            fixed,
+            q_rows if fixed else "dynamic",
+            selected_width,
+            split_chunks,
+            self.num_q_heads,
+            self.index_num_q_heads,
+        )
+        workspace = cache.get(key)
+        if workspace is None and fixed:
+            workspace = self._find_b12x_compressed_mla_workspace(
+                q_rows=q_rows,
+                selected_width=selected_width,
+                split_chunks=split_chunks,
+            )
+        if workspace is not None and not fixed:
+            if (
+                int(getattr(workspace, "max_total_q", 0)) < q_rows
+                or int(getattr(workspace, "max_batch", 0)) < q_rows
+                or int(getattr(workspace, "max_chunks_per_row", 0))
+                < split_chunks
+            ):
+                workspace = None
+        if workspace is None:
+            if fixed and self._b12x_attention_bundle is not None:
+                contract = B12XAttentionWorkspaceContract(
+                    mode="decode",
+                    max_total_q=q_rows,
+                    max_batch=q_rows,
+                    max_paged_q_rows=q_rows,
+                    max_kv_rows=0,
+                    v_head_dim=self.head_dim_v,
+                    indexer_num_q_heads=self.index_num_q_heads,
+                    max_page_table_width=1,
+                    topk=selected_width,
+                    max_chunks_per_row=split_chunks,
+                )
+                workspace = self._b12x_attention_bundle.arena.make_workspace(
+                    contract,
+                    use_cuda_graph=True,
+                )
+            else:
+                if fixed:
+                    raise RuntimeError(
+                        "b12x DeepSeek V4 fixed compressed MLA workspace requested "
+                        "before the joint attention arena was initialized"
+                    )
+                factory = (
+                    B12XAttentionWorkspace.for_fixed_capacity
+                    if fixed
+                    else B12XAttentionWorkspace.for_contract
+                )
+                kwargs = {}
+                workspace = factory(
+                    mode="decode",
+                    device=self.device,
+                    dtype=torch.bfloat16,
+                    kv_dtype=torch.uint8,
+                    num_q_heads=self.num_q_heads,
+                    indexer_num_q_heads=self.index_num_q_heads,
+                    head_dim=B12X_COMPRESSED_MLA_HEAD_DIM,
+                    v_head_dim=self.head_dim_v,
+                    topk=selected_width,
+                    max_page_table_width=1,
+                    max_total_q=q_rows,
+                    max_batch=q_rows,
+                    max_paged_q_rows=q_rows,
+                    max_kv_rows=0,
+                    page_size=64,
+                    use_cuda_graph=fixed,
+                    max_chunks_per_row=split_chunks,
+                    **kwargs,
+                )
+            cache[key] = workspace
+        return workspace
+
+    def _find_b12x_compressed_mla_workspace(
+        self,
+        *,
+        q_rows: int,
+        selected_width: int,
+        split_chunks: int,
+    ):
+        candidates = []
+        for (
+            fixed,
+            _q_key,
+            _width_key,
+            _chunks_key,
+            num_q_heads,
+            index_num_q_heads,
+        ), workspace in self._b12x_compressed_workspaces.items():
+            if not fixed:
+                continue
+            if num_q_heads != self.num_q_heads or index_num_q_heads != self.index_num_q_heads:
+                continue
+            if int(getattr(workspace, "max_total_q", 0)) < q_rows:
+                continue
+            if int(getattr(workspace, "topk", 0)) < selected_width:
+                continue
+            if int(getattr(workspace, "max_chunks_per_row", 0)) < split_chunks:
+                continue
+            candidates.append(workspace)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda workspace: (
+                int(getattr(workspace, "max_total_q", 0)),
+                int(getattr(workspace, "topk", 0)),
+                int(getattr(workspace, "max_chunks_per_row", 0)),
+            ),
+        )
+
+    def _prime_b12x_fixed_workspaces_for_metadata(
+        self,
+        metadata: Union[
+            DSV4Metadata,
+            DSV4RawVerifyMetadata,
+            DSV4RawDecodeMetadata,
+        ],
+        *,
+        compressed_q_rows: int,
+        indexer_q_rows: int,
+        indexer_logits_mode: Literal["dense", "tiled"] = "tiled",
+    ) -> None:
+        if not isinstance(metadata, DSV4Metadata):
+            return
+        core_metadata = metadata.core_attn_metadata
+        selected_widths = {core_metadata.swa_page_indices.shape[1]}
+        if core_metadata.c4_sparse_page_indices is not None:
+            selected_widths.add(
+                core_metadata.swa_page_indices.shape[1]
+                + core_metadata.c4_sparse_page_indices.shape[1]
+            )
+        if core_metadata.c128_page_indices is not None:
+            selected_widths.add(
+                core_metadata.swa_page_indices.shape[1]
+                + core_metadata.c128_page_indices.shape[1]
+            )
+
+        for selected_width in selected_widths:
+            self._get_b12x_compressed_mla_workspace(
+                q_rows=compressed_q_rows,
+                selected_width=selected_width,
+                fixed=True,
+            )
+
+        if metadata.indexer_metadata is not None:
+            indexer_workspace = self._get_b12x_indexer_paged_workspace(
+                q_rows=indexer_q_rows,
+                page_table_width=metadata.indexer_metadata.page_table.shape[1],
+                fixed=True,
+                logits_mode=indexer_logits_mode,
+            )
+            if indexer_logits_mode == "tiled":
+                self._prewarm_b12x_tiled_indexer_workspace(
+                    indexer_workspace=indexer_workspace,
+                    page_table_width=metadata.indexer_metadata.page_table.shape[1],
+                    indexer_q_rows=indexer_q_rows,
+                )
+
+    def _prewarm_b12x_tiled_indexer_workspace(
+        self,
+        *,
+        indexer_workspace,
+        page_table_width: int,
+        indexer_q_rows: int,
+    ) -> None:
+        if not self._b12x_uses_c4_attention():
+            return
+        if hasattr(indexer_workspace, "prewarm_paged_indexer_tiled_topk"):
+            indexer_workspace.prewarm_paged_indexer_tiled_topk()
+        if hasattr(indexer_workspace, "prewarm_paged_indexer_tiled_scorer"):
+            supertile_tokens = self._b12x_c4_indexer_supertile_tokens_capacity(
+                page_table_width=page_table_width,
+                q_rows=indexer_q_rows,
+            )
+            indexer_workspace.prewarm_paged_indexer_tiled_scorer(
+                index_k_cache=self.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    self._b12x_first_c4_layer_id()
+                ),
+                width_tokens=supertile_tokens,
+            )
+
+    def _prime_b12x_cuda_graph_workspaces(
+        self,
+        metadata: Union[
+            DSV4Metadata,
+            DSV4RawVerifyMetadata,
+            DSV4RawDecodeMetadata,
+        ],
+        *,
+        q_rows: int,
+    ) -> None:
+        self._prime_b12x_fixed_workspaces_for_metadata(
+            metadata,
+            compressed_q_rows=q_rows,
+            indexer_q_rows=q_rows,
+            indexer_logits_mode="dense",
+        )
+
+    def _prime_b12x_default_fixed_workspaces(
+        self,
+        *,
+        compressed_q_rows: Optional[int] = None,
+        indexer_q_rows: Optional[int] = None,
+        indexer_logits_mode: Literal["dense", "tiled"] = "tiled",
+        log: bool = True,
+    ) -> None:
+        if compressed_q_rows is None:
+            compressed_q_rows = self._b12x_compressed_prefill_q_capacity()
+        if indexer_q_rows is None:
+            indexer_q_rows = self._b12x_eager_extend_total_q_capacity()
+        selected_widths = self._b12x_compressed_selected_widths()
+        for selected_width in selected_widths:
+            self._get_b12x_compressed_mla_workspace(
+                q_rows=compressed_q_rows,
+                selected_width=selected_width,
+                fixed=True,
+            )
+
+        page_table_width = 0
+        if self._b12x_uses_c4_attention():
+            page_table_width = self._b12x_indexer_page_table_width_capacity()
+            indexer_workspace = self._get_b12x_indexer_paged_workspace(
+                q_rows=indexer_q_rows,
+                page_table_width=page_table_width,
+                fixed=True,
+                logits_mode=indexer_logits_mode,
+            )
+            if indexer_logits_mode == "tiled":
+                self._prewarm_b12x_tiled_indexer_workspace(
+                    indexer_workspace=indexer_workspace,
+                    page_table_width=page_table_width,
+                    indexer_q_rows=indexer_q_rows,
+                )
+        if log:
+            logger.info(
+                "Initialized b12x compressed MLA fixed workspaces: "
+                "compressed_q_capacity=%s indexer_q_capacity=%s "
+                "selected_widths=%s page_table_width=%s",
+                compressed_q_rows,
+                indexer_q_rows,
+                list(selected_widths),
+                page_table_width,
+            )
+
+    def _prime_b12x_default_cuda_graph_workspaces(self, *, q_rows: int) -> None:
+        self._prime_b12x_default_fixed_workspaces(
+            compressed_q_rows=q_rows,
+            indexer_q_rows=q_rows,
+            indexer_logits_mode="dense",
+            log=False,
+        )
+
+    def get_b12x_indexer_paged_workspace(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        q_rows: int,
+        page_table_width: int,
+        logits_mode: Literal["dense", "tiled"] = "tiled",
+    ):
+        fixed = self._use_b12x_fixed_workspace(forward_batch)
+        prefill_q_capacity = self._b12x_prefill_q_capacity(
+            forward_batch=forward_batch,
+            q_rows=q_rows,
+        )
+        if prefill_q_capacity is not None:
+            fixed = True
+            q_rows = prefill_q_capacity
+        return self._get_b12x_indexer_paged_workspace(
+            q_rows=q_rows,
+            page_table_width=page_table_width,
+            fixed=fixed,
+            logits_mode=logits_mode,
+        )
+
+    def _get_b12x_indexer_paged_workspace(
+        self,
+        *,
+        q_rows: int,
+        page_table_width: int,
+        fixed: bool,
+        logits_mode: Literal["dense", "tiled"] = "tiled",
+    ):
+        if not fixed:
+            return None
+
+        from b12x.integration.mla import B12XAttentionWorkspaceContract
+
+        q_rows = max(int(q_rows), 1)
+        page_table_width_capacity = self._b12x_indexer_page_table_width_capacity()
+        page_table_width = min(max(int(page_table_width), 1), page_table_width_capacity)
+        if logits_mode == "dense":
+            workspace_page_table_width = page_table_width_capacity
+        elif logits_mode == "tiled":
+            workspace_page_table_width = page_table_width_capacity
+        else:
+            raise ValueError(f"unknown b12x C4 indexer logits mode {logits_mode!r}")
+        key = (
+            logits_mode,
+            q_rows,
+            workspace_page_table_width,
+            self.num_q_heads,
+            self.index_num_q_heads,
+        )
+        workspace = self._b12x_indexer_workspaces.get(key)
+        if workspace is None:
+            workspace = self._find_b12x_indexer_paged_workspace(
+                q_rows=q_rows,
+                page_table_width=workspace_page_table_width,
+                logits_mode=logits_mode,
+            )
+        if workspace is None:
+            if self._b12x_attention_bundle is not None:
+                contract = B12XAttentionWorkspaceContract(
+                    mode="decode",
+                    max_total_q=1,
+                    max_batch=1,
+                    max_paged_q_rows=q_rows,
+                    max_kv_rows=0,
+                    v_head_dim=self.head_dim_v,
+                    indexer_num_q_heads=self.index_num_q_heads,
+                    max_page_table_width=workspace_page_table_width,
+                    topk=self.c4_topk,
+                )
+                workspace = self._b12x_attention_bundle.arena.make_workspace(
+                    contract,
+                    use_cuda_graph=True,
+                )
+            else:
+                raise RuntimeError(
+                    "b12x DeepSeek V4 fixed paged indexer workspace requested "
+                    "before the joint attention arena was initialized"
+                )
+            self._b12x_indexer_workspaces[key] = workspace
+        return workspace
+
+    def _find_b12x_indexer_paged_workspace(
+        self,
+        *,
+        q_rows: int,
+        page_table_width: int,
+        logits_mode: Literal["dense", "tiled"] = "tiled",
+    ):
+        candidates = []
+        for (
+            mode_key,
+            _q_key,
+            _width_key,
+            num_q_heads,
+            index_num_q_heads,
+        ), workspace in self._b12x_indexer_workspaces.items():
+            if mode_key != logits_mode:
+                continue
+            if num_q_heads != self.num_q_heads or index_num_q_heads != self.index_num_q_heads:
+                continue
+            if int(getattr(workspace, "max_paged_q_rows", 0)) < q_rows:
+                continue
+            if int(getattr(workspace, "max_page_table_width", 0)) < page_table_width:
+                continue
+            if logits_mode == "dense" and getattr(workspace, "indexer_paged_logits", None) is None:
+                continue
+            if logits_mode == "tiled" and getattr(workspace, "indexer_extend_tile_logits", None) is None:
+                continue
+            candidates.append(workspace)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda workspace: (
+                int(getattr(workspace, "max_paged_q_rows", 0)),
+                int(getattr(workspace, "max_page_table_width", 0)),
+            ),
         )
 
     def init_forward_metadata_decode(
@@ -390,7 +1419,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._use_prep_in_cuda_graph and envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             return DSV4RawDecodeMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
@@ -403,10 +1432,14 @@ class DeepseekV4AttnBackend(
             seq_lens_casual=seq_lens,
             max_seq_len=max_seq_len,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=self._b12x_uses_compressed_attention(),
         )
 
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if self._b12x_uses_c4_attention()
+            else None
+        )
 
         create = functools.partial(
             create_paged_compressor_data,
@@ -417,11 +1450,12 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
         )
 
+        need_compress = self._b12x_uses_compressed_attention()
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c4_compress_metadata=create(compress_ratio=4) if need_compress else None,
+            c128_compress_metadata=create(compress_ratio=128) if need_compress else None,
         )
 
     def init_forward_metadata_prefill(
@@ -454,8 +1488,11 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
         )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
-            if need_compress
+            self.init_forward_metadata_indexer(
+                core_attn_metadata,
+                shared_page_table=len(seq_lens_cpu) == 1,
+            )
+            if need_compress and self._b12x_uses_c4_attention()
             else None
         )
         if not need_compress:
@@ -488,7 +1525,7 @@ class DeepseekV4AttnBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
+        if self._use_prep_in_cuda_graph and envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
             assert out_cache_loc is not None
             if not hasattr(self, "extend_seq_lens_buffer"):
                 self.extend_seq_lens_buffer = torch.tensor(
@@ -539,7 +1576,7 @@ class DeepseekV4AttnBackend(
             num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            need_compress=True,
+            need_compress=self._b12x_uses_compressed_attention(),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
@@ -565,9 +1602,13 @@ class DeepseekV4AttnBackend(
             seq_lens_casual=seq_lens_casual,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=self._b12x_uses_compressed_attention(),
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if self._b12x_uses_c4_attention()
+            else None
+        )
         create = functools.partial(
             create_paged_compressor_data,
             is_prefill=True,
@@ -581,11 +1622,12 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
         )
+        need_compress = self._b12x_uses_compressed_attention()
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c4_compress_metadata=create(compress_ratio=4) if need_compress else None,
+            c128_compress_metadata=create(compress_ratio=128) if need_compress else None,
         )
 
     def make_forward_metadata_from_raw_decode(
@@ -601,9 +1643,13 @@ class DeepseekV4AttnBackend(
             seq_lens_casual=seq_lens,
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
-            need_compress=True,
+            need_compress=self._b12x_uses_compressed_attention(),
         )
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
+        indexer_metadata = (
+            self.init_forward_metadata_indexer(core_attn_metadata)
+            if self._b12x_uses_c4_attention()
+            else None
+        )
 
         create = functools.partial(
             create_paged_compressor_data,
@@ -614,11 +1660,12 @@ class DeepseekV4AttnBackend(
             seq_lens=seq_lens,
         )
 
+        need_compress = self._b12x_uses_compressed_attention()
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            c4_compress_metadata=create(compress_ratio=4) if need_compress else None,
+            c128_compress_metadata=create(compress_ratio=128) if need_compress else None,
         )
 
     def init_forward_metadata_draft_extend(
@@ -662,6 +1709,7 @@ class DeepseekV4AttnBackend(
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
+        prefill_num_tokens: Optional[int] = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             metadata = self.init_forward_metadata_decode(
@@ -687,21 +1735,33 @@ class DeepseekV4AttnBackend(
                 and extend_seq_lens_cpu is not None
             )
             is_draft = forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            prefill_num_tokens = sum(extend_seq_lens_cpu)
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 out_cache_loc=forward_batch.out_cache_loc,
-                num_tokens=sum(extend_seq_lens_cpu),
+                num_tokens=prefill_num_tokens,
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
-                need_compress=not is_draft,
+                need_compress=(not is_draft) and self._b12x_uses_compressed_attention(),
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
         self.forward_metadata = metadata
+        if prefill_num_tokens is not None:
+            prefill_q_capacity = self._b12x_prefill_q_capacity(
+                forward_batch=forward_batch,
+                q_rows=prefill_num_tokens,
+            )
+            assert prefill_q_capacity is not None
+            self._prime_b12x_fixed_workspaces_for_metadata(
+                metadata,
+                compressed_q_rows=self._b12x_compressed_prefill_q_capacity(),
+                indexer_q_rows=prefill_q_capacity,
+            )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -714,6 +1774,7 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_bs = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        self._prime_b12x_default_cuda_graph_workspaces(q_rows=max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -761,6 +1822,7 @@ class DeepseekV4AttnBackend(
         else:
             raise NotImplementedError(f"{forward_mode=} not supported yet")
 
+        self._prime_b12x_cuda_graph_workspaces(metadata, q_rows=num_tokens)
         self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = metadata
         self.forward_metadata = metadata
         if raw_type is not None:
@@ -876,15 +1938,6 @@ class DeepseekV4AttnBackend(
         return 1
 
     def on_after_cuda_graph_warmup(self):
-        metadata = self.forward_metadata
-        if isinstance(metadata, DSV4Metadata) and isinstance(
-            metadata.core_attn_metadata, DSV4AttnMetadata
-        ):
-            core = metadata.core_attn_metadata
-            core.c1_flashmla_metadata = _create_flashmla_metadata()
-            core.c4_flashmla_metadata = _create_flashmla_metadata()
-            core.c128_flashmla_metadata = _create_flashmla_metadata()
-
         # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
         # restore raw so capture re-runs the upgrade inside the graph.
         current_raw = getattr(self, "_current_capture_raw", None)
@@ -959,35 +2012,18 @@ class DeepseekV4AttnBackend(
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
+            indexed_page_table = None
             if compress_ratio == 4:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
                 extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
+                if forward_batch.hisparse_coordinator is None:
+                    indexed_page_table = core_attn_metadata.page_table
             elif compress_ratio == 128:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
 
-            swa_window_size = token_to_kv_pool.swa_window_size
-            assert swa_k_cache.ndim == 2
-            k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
-            swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
-                swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
-            )
-
-            if extra_k_cache is not None:
-                page_sizes = {
-                    4: token_to_kv_pool.page_size // 4,
-                    128: token_to_kv_pool.page_size // 128,
-                }
-                extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
-                ].view(
-                    extra_k_cache.shape[0],
-                    page_sizes[compress_ratio],
-                    1,
-                    k_cache_total_dim,
-                )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
 
@@ -1001,17 +2037,34 @@ class DeepseekV4AttnBackend(
                     swa_topk_lengths = _pad_tensor_to_size(
                         swa_topk_lengths, q.shape[0], value=1
                     )
+                if extra_indices is not None and extra_indices.shape[0] != q.shape[0]:
+                    extra_indices = _pad_tensor_to_size(
+                        extra_indices, q.shape[0], value=-1
+                    )
+                if (
+                    extra_topk_lengths is not None
+                    and extra_topk_lengths.shape[0] != q.shape[0]
+                ):
+                    extra_topk_lengths = _pad_tensor_to_size(
+                        extra_topk_lengths, q.shape[0], value=0
+                    )
+                if (
+                    indexed_page_table is not None
+                    and indexed_page_table.shape[0] != q.shape[0]
+                ):
+                    indexed_page_table = _pad_tensor_to_size(
+                        indexed_page_table, q.shape[0], value=0
+                    )
 
-            if q.ndim == 3:
-                q = q.unsqueeze(1)
-            if swa_page_indices.ndim == 2:
-                swa_page_indices = swa_page_indices.unsqueeze(1)
-            if extra_indices is not None and extra_indices.ndim == 2:
-                extra_indices = extra_indices.unsqueeze(1)
+            if q.ndim == 4:
+                assert q.shape[1] == 1, f"expected singleton MQA dim, got {q.shape=}"
+                q = q.squeeze(1)
+            assert q.ndim == 3, f"expected q rank 3, got {q.shape=}"
+            assert swa_page_indices.ndim == 2, f"{swa_page_indices.shape=}"
+            if extra_indices is not None:
+                assert extra_indices.ndim == 2, f"{extra_indices.shape=}"
 
             assert attn_sink is not None
-
-            flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
             assert (
                 swa_page_indices.shape[-1] % 64 == 0
@@ -1021,27 +2074,80 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            import flash_mla
+            indexed_page_size = None
+            if extra_k_cache is not None:
+                indexed_page_size = token_to_kv_pool.page_size // compress_ratio
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+            selected_width = swa_page_indices.shape[1] + (
+                extra_indices.shape[1] if extra_indices is not None else 0
+            )
 
-            o = o.squeeze(1)
-            return o
+            from b12x.integration.mla import compressed_mla_decode_forward
+
+            def _forward_compressed_slice(row_start: int, row_end: int) -> torch.Tensor:
+                workspace = self.get_b12x_compressed_mla_workspace(
+                    forward_batch=forward_batch,
+                    q_rows=row_end - row_start,
+                    selected_width=selected_width,
+                )
+                indexed_indices_slice = (
+                    None
+                    if extra_indices is None
+                    else extra_indices[row_start:row_end]
+                )
+                indexed_lengths_slice = (
+                    None
+                    if extra_topk_lengths is None
+                    else extra_topk_lengths[row_start:row_end]
+                )
+                indexed_page_table_slice = (
+                    None
+                    if indexed_page_table is None
+                    else indexed_page_table[row_start:row_end]
+                )
+                return compressed_mla_decode_forward(
+                    q_all=q[row_start:row_end],
+                    swa_k_cache=swa_k_cache,
+                    swa_indices=swa_page_indices[row_start:row_end],
+                    swa_topk_lengths=swa_topk_lengths[row_start:row_end],
+                    swa_page_size=token_to_kv_pool.swa_page_size,
+                    indexed_k_cache=extra_k_cache,
+                    indexed_indices=indexed_indices_slice,
+                    indexed_topk_lengths=indexed_lengths_slice,
+                    indexed_page_size=indexed_page_size,
+                    indexed_page_table=indexed_page_table_slice,
+                    attn_sink=attn_sink,
+                    workspace=workspace,
+                    sm_scale=self.softmax_scale,
+                    expected_num_q_heads=self.num_q_heads,
+                )
+
+            q_rows = q.shape[0]
+            if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+                compressed_q_capacity = self._b12x_compressed_prefill_q_capacity()
+                if q_rows > compressed_q_capacity:
+                    if (
+                        get_is_capture_mode()
+                        or (
+                            self.device.type == "cuda"
+                            and torch.cuda.is_current_stream_capturing()
+                        )
+                    ):
+                        raise RuntimeError(
+                            "b12x DeepSeek V4 compressed MLA prefill slicing cannot "
+                            "allocate its output while CUDA graph capture is active: "
+                            f"q_rows={q_rows}, "
+                            f"compressed_q_capacity={compressed_q_capacity}"
+                        )
+                    output = q.new_empty(q_rows, q.shape[1], layer.v_head_dim)
+                    for row_start in range(0, q_rows, compressed_q_capacity):
+                        row_end = min(row_start + compressed_q_capacity, q_rows)
+                        output[row_start:row_end].copy_(
+                            _forward_compressed_slice(row_start, row_end)
+                        )
+                    return output
+
+            return _forward_compressed_slice(0, q_rows)
 
         raise NotImplementedError("ragged attention")
 
@@ -1119,12 +2225,15 @@ class DeepseekV4AttnBackend(
         )
 
         raw_positions = seq_lens_casual - 1
-        swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+        swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW).to(
+            torch.int32
+        )
+        swa_topk_lengths = swa_topk_lengths.contiguous()
 
         page_table = req_to_token[
             req_pool_indices_repeated, : max_seq_len : self.page_size
         ]
-        page_table = (page_table // self.page_size).to(torch.int32)
+        page_table = (page_table // self.page_size).to(torch.int32).contiguous()
 
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,
@@ -1136,17 +2245,19 @@ class DeepseekV4AttnBackend(
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
+            c128_index_capacity=(
+                self._b12x_c128_index_width_capacity()
+                if need_compress and self._b12x_uses_c128_attention()
+                else None
+            ),
         )
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()
-            core_attn_metadata.init_flashmla_related()
+            core_attn_metadata.init_sparse_mla_related()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
             core_attn_metadata.c4_sparse_page_indices = None
-            core_attn_metadata.c1_flashmla_metadata = _create_flashmla_metadata()
-            core_attn_metadata.c4_flashmla_metadata = None
-            core_attn_metadata.c128_flashmla_metadata = None
         return core_attn_metadata
 
     def get_swa_page_indices(

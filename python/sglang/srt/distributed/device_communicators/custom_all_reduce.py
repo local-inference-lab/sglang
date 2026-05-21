@@ -77,7 +77,9 @@ def _load_b12x_pcie_oneshot_runtime():
         module = importlib.import_module("b12x.distributed")
     except Exception:
         return None
-    return getattr(module, "PCIeOneshotAllReduce", None)
+    return getattr(module, "PCIeOneshotAllReducePool", None) or getattr(
+        module, "PCIeOneshotAllReduce", None
+    )
 
 
 class CustomAllreduce:
@@ -95,6 +97,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
+        device_group: Optional[ProcessGroup] = None,
         max_size=_MAX_CAR_SIZE,
     ) -> None:
         """
@@ -125,6 +128,7 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
         self.group = group
+        self.device_group = device_group
         self.rank = rank
         self.world_size = world_size
         self.max_size = max_size
@@ -153,7 +157,7 @@ class CustomAllreduce:
             self.max_size = min(max_size, pcie_max_size)
 
             self._pcie_runtime = runtime_cls.from_exchange_group(
-                exchange_group=group,
+                exchange_group=device_group or group,
                 device=self.device,
                 eager_buffer_bytes=self.max_size,
                 max_size=self.max_size,
@@ -305,7 +309,9 @@ class CustomAllreduce:
 
     def register_graph_buffers(self):
         if self._pcie_runtime is not None:
-            self._pcie_runtime.register_graph_buffers()
+            register = getattr(self._pcie_runtime, "register_graph_buffers", None)
+            if register is not None:
+                register()
             return
         if _is_hip:
             handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
@@ -336,7 +342,10 @@ class CustomAllreduce:
         if self.disabled:
             return False
         if self._pcie_runtime is not None:
-            return self._pcie_runtime.should_allreduce(inp)
+            should_allreduce = getattr(self._pcie_runtime, "should_allreduce", None)
+            if should_allreduce is not None:
+                return should_allreduce(inp)
+            return self._pcie_runtime.for_stream().should_allreduce(inp)
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -410,9 +419,19 @@ class CustomAllreduce:
 
     def find_crossover_size(self, nccl_group) -> int:
         if self._pcie_runtime is None:
-            raise RuntimeError("crossover autotuning is only available for the b12x PCIe oneshot backend")
-        crossover = self._pcie_runtime.find_crossover_size(nccl_group)
-        self.max_size = self._pcie_runtime.max_size
+            raise RuntimeError(
+                "crossover autotuning is only available for the b12x PCIe oneshot backend"
+            )
+        find_crossover_size = getattr(self._pcie_runtime, "find_crossover_size", None)
+        if find_crossover_size is not None:
+            crossover = find_crossover_size(nccl_group)
+            self.max_size = self._pcie_runtime.max_size
+            return crossover
+
+        channel = self._pcie_runtime.for_stream()
+        crossover = channel.find_crossover_size(nccl_group)
+        self.max_size = channel.max_size
+        self._pcie_runtime.max_size = channel.max_size
         return crossover
 
     def close(self):

@@ -365,10 +365,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
-        quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        indexer_bytes = self.indexer_head_dim * torch.bfloat16.itemsize
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         state_dtype_size = 4

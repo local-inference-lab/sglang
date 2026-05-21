@@ -722,6 +722,7 @@ class NativeSparseAttnBackend(
         return B12XMoEArenaCaps(
             device=self.device,
             dtype=self.q_dtype,
+            quant_mode="nvfp4",
             weight_E=int(weight_E),
             k=int(hidden_size),
             n=intermediate_size // tp_size,
@@ -898,8 +899,6 @@ class NativeSparseAttnBackend(
         workspace=None,
     ) -> torch.Tensor:
         from b12x.integration.mla import (
-            MLASparseDecodeMetadata,
-            MLASparseExtendMetadata,
             sparse_mla_decode_forward,
             sparse_mla_extend_forward,
         )
@@ -919,35 +918,23 @@ class NativeSparseAttnBackend(
                 v_head_dim=v_head_dim,
             )
         if mode == "decode":
-            b12x_metadata = MLASparseDecodeMetadata(
-                page_table_1=selected_indices,
-                cache_seqlens_int32=metadata.cache_seqlens_int32,
-                nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-                max_seq_len_k=metadata.max_seq_len_k,
-            )
             return sparse_mla_decode_forward(
                 q_all=q_all,
                 kv_cache=kv_cache,
-                metadata=b12x_metadata,
+                page_table_1=selected_indices,
+                cache_seqlens_int32=metadata.cache_seqlens_int32,
+                nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
                 workspace=workspace,
                 sm_scale=sm_scale,
                 v_head_dim=v_head_dim,
             )
 
-        b12x_metadata = MLASparseExtendMetadata(
-            selected_token_offsets=selected_indices,
-            cache_seqlens_int32=metadata.cache_seqlens_int32,
-            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
-            nsa_cu_seqlens_q=metadata.nsa_cu_seqlens_q,
-            nsa_cu_seqlens_k=metadata.nsa_cu_seqlens_k,
-            max_seq_len_q=metadata.max_seq_len_q,
-            max_seq_len_k=metadata.max_seq_len_k,
-            mode=mode,
-        )
         return sparse_mla_extend_forward(
             q_all=q_all,
             kv_cache=kv_cache,
-            metadata=b12x_metadata,
+            selected_token_offsets=selected_indices,
+            cache_seqlens_int32=metadata.cache_seqlens_int32,
+            nsa_cache_seqlens_int32=metadata.nsa_cache_seqlens_int32,
             workspace=workspace,
             sm_scale=sm_scale,
             v_head_dim=v_head_dim,

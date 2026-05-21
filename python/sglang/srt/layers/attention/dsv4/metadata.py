@@ -6,9 +6,6 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
-
 if TYPE_CHECKING:
     pass
 
@@ -18,7 +15,7 @@ Some comments on the common terms used in DeepSeekV4Backend:
 
 topk_lengths:
     NOTE: TL;DR: topk_lengths == seq_lens
-    The FlashMLA sparse decode kernel will attend to `k` tokens for each query.
+    The sparse decode kernel will attend to `k` tokens for each query.
     `topk_lengths` indicates how many tokens each query will attend to.
     This should be named as `seq_lens`, but we simply follow the naming convention.
 
@@ -44,7 +41,7 @@ positions:
 Some other notes:
     c4_ / c128_: means "compressed by 4" / "compressed by 128".
     c4_page_size: page_size // 4
-    c4_seq_lens: seq_lens // 4, but bounded by at least 1, due to flash_mla requirement.
+    c4_seq_lens: seq_lens // 4, but bounded by at least 1 for sparse attention.
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
@@ -94,44 +91,78 @@ def copy_metadata(
     ), f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
 
 
+def _is_cuda_graph_capture_active(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
 @dataclass
 class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
-    deep_gemm_metadata: Any = field(init=False, repr=False)
+    expected_num_q_heads: Optional[int] = None
+    shared_page_table: bool = False
+    b12x_metadata: Any = field(init=False, repr=False)
+    b12x_schedule_metadata: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            self.deep_gemm_metadata = None
-        else:
-            import deep_gemm
-
-            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
-                from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
-
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
-
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
-
-        from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
-
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
-            self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
-        else:
-            self.topk_metadata = torch.empty((0,))
-
         assert self.page_size == 256, "the system hardcodes page_size=256"
+        if self.page_table.dtype != torch.int32:
+            self.page_table = self.page_table.to(torch.int32)
+        if self.page_table.dim() != 2:
+            raise ValueError(
+                f"paged indexer page_table must be rank-2, got {self.page_table.shape=}"
+            )
+        if not self.page_table.is_contiguous():
+            self.page_table = self.page_table.contiguous()
+
+        c4_seq_lens = self.c4_seq_lens.to(torch.int32)
+        if c4_seq_lens.dim() == 2:
+            if c4_seq_lens.shape[-1] != 1:
+                raise ValueError(
+                    "paged indexer c4_seq_lens rank-2 input must have trailing "
+                    f"dimension 1, got {tuple(c4_seq_lens.shape)}"
+                )
+            c4_seq_lens = c4_seq_lens.squeeze(-1)
+        if c4_seq_lens.dim() != 1:
+            raise ValueError(
+                f"paged indexer c4_seq_lens must be rank-1, got {c4_seq_lens.shape=}"
+            )
+        self.c4_seq_lens = c4_seq_lens.contiguous()
+        self._refresh_b12x_metadata()
+
+        self.topk_metadata = torch.empty(
+            (0,),
+            dtype=torch.int32,
+            device=self.c4_seq_lens.device,
+        )
+
+    def _refresh_b12x_metadata(
+        self,
+        *,
+        build_schedule: Optional[bool] = None,
+        validate_raw_lengths: Optional[bool] = None,
+    ) -> None:
+        from b12x.integration.paged_mqa_indexer import (
+            prepare_paged_mqa_indexer_metadata,
+        )
+
+        if validate_raw_lengths is None:
+            validate_raw_lengths = self.page_table.device.type != "cuda"
+        self.b12x_metadata = prepare_paged_mqa_indexer_metadata(
+            real_page_table=self.page_table,
+            cache_seqlens_int32=self.c4_seq_lens,
+            page_size=self.c4_page_size,
+            expected_num_q_heads=self.expected_num_q_heads,
+            paged_mqa_schedule_metadata=self.b12x_schedule_metadata,
+            build_schedule=build_schedule,
+            validate_raw_lengths=validate_raw_lengths,
+            shared_page_table=self.shared_page_table,
+        )
+        self.b12x_schedule_metadata = self.b12x_metadata.paged_mqa_schedule_metadata
 
     @property
     def c4_page_size(self) -> int:
@@ -146,16 +177,33 @@ class PagedIndexerMetadata:
         return self.page_table.shape[1] * self.c4_page_size
 
     def copy_(self, other: "PagedIndexerMetadata"):
-        if is_hip():
-            copy_fields = ["page_table", "c4_seq_lens"]
+        assert self.page_size == other.page_size
+        assert self.expected_num_q_heads == other.expected_num_q_heads
+        self.shared_page_table = other.shared_page_table
+        self.page_table.copy_(other.page_table)
+        self.c4_seq_lens.copy_(other.c4_seq_lens)
+        self.topk_metadata.copy_(other.topk_metadata)
+
+        other_schedule = other.b12x_schedule_metadata
+        if other_schedule is None:
+            self.b12x_schedule_metadata = None
+        elif (
+            self.b12x_schedule_metadata is None
+            or self.b12x_schedule_metadata.shape != other_schedule.shape
+        ):
+            if _is_cuda_graph_capture_active(other_schedule.device):
+                raise RuntimeError(
+                    "b12x paged-MQA schedule metadata was not allocated before "
+                    "CUDA graph capture"
+                )
+            self.b12x_schedule_metadata = torch.empty_like(other_schedule)
+            self.b12x_schedule_metadata.copy_(other_schedule)
         else:
-            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
-        copy_fields += ["topk_metadata"]
-        copy_metadata(
-            src=other,
-            dst=self,
-            check_eq_fields=["page_size"],
-            copy_fields=copy_fields,
+            self.b12x_schedule_metadata.copy_(other_schedule)
+
+        self._refresh_b12x_metadata(
+            build_schedule=False,
+            validate_raw_lengths=False,
         )
 
 

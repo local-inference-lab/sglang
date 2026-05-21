@@ -91,6 +91,7 @@ def _init_compressed_attn_metadata_triton(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    max_c128_page_indices: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -121,6 +122,10 @@ def _init_compressed_attn_metadata_triton(
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
         c128_max_seq_len = c128_page_size * max_pages
+        if max_c128_page_indices is not None:
+            c128_max_seq_len = min(
+                c128_max_seq_len, max(1, int(max_c128_page_indices))
+            )
         c128_page_indices = torch.empty(
             bs, c128_max_seq_len, dtype=torch.int32, device=device
         )
@@ -180,6 +185,7 @@ def init_compression_metadata(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    max_c128_page_indices: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -197,4 +203,5 @@ def init_compression_metadata(
         page_table,
         page_size,
         compute_page_indices,
+        max_c128_page_indices,
     )

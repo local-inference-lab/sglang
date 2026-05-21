@@ -444,6 +444,19 @@ class PiecewiseCudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
 
+    def _log_can_run_reject(self, reason: str, forward_batch: ForwardBatch):
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        logger.debug(
+            "Piecewise CUDA graph cannot run: %s, num_tokens=%s, max_num_tokens=%s, "
+            "batch_size=%s, forward_mode=%s",
+            reason,
+            len(forward_batch.input_ids),
+            self.max_num_tokens,
+            forward_batch.batch_size,
+            forward_batch.forward_mode,
+        )
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it

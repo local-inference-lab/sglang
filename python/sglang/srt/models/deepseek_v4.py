@@ -13,7 +13,12 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
@@ -34,6 +39,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_global_dp_buffer,
@@ -45,7 +51,6 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -137,6 +142,36 @@ def rms_normalize_triton(
         HAS_WEIGHT=(weight is not None),
     )
     return x
+
+
+def _hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+):
+    pre_mix = torch.sigmoid(
+        mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    ) + eps
+    post_mix = 2 * torch.sigmoid(
+        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1]
+        + hc_base[hc_mult : 2 * hc_mult]
+    )
+
+    comb_mix = (
+        mixes[..., 2 * hc_mult :].view(*mixes.shape[:-1], hc_mult, hc_mult)
+        * hc_scale[2]
+        + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
+    )
+    comb_mix = torch.softmax(comb_mix, dim=-1) + eps
+    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + eps)
+        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + eps)
+
+    return pre_mix, post_mix, comb_mix
 
 
 class MQALayer(nn.Module):
@@ -293,6 +328,9 @@ class MQALayer(nn.Module):
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
+            # Plain ColumnParallelLinear scale loading still shards by the local
+            # parameter shape. This marker only prevents post-load DeepGEMM
+            # requantization so b12x can consume the checkpoint FP8 weights.
             self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -304,6 +342,11 @@ class MQALayer(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
+        if _FP8_WO_A_GEMM:
+            self.wo_a.b12x_skip_generic_block_fp8_linear = True
+            self.wo_b.b12x_skip_generic_block_fp8_linear = True
+        self.b12x_wo_projection_weights = None
+        self._b12x_wo_projection_workspace_cache = {}
 
         self.attn_mqa = RadixAttention(
             self.n_local_heads,
@@ -317,6 +360,177 @@ class MQALayer(nn.Module):
 
         self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
         self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
+
+    def set_b12x_wo_projection_workspace_cache(self, cache) -> None:
+        self._b12x_wo_projection_workspace_cache = cache
+
+    def setup_b12x_wo_projection(self) -> None:
+        if not _FP8_WO_A_GEMM:
+            return
+        if self.b12x_wo_projection_weights is not None:
+            return
+
+        if not hasattr(self.wo_a, "weight_scale_inv"):
+            raise RuntimeError("b12x WO projection requires FP8 wo_a.weight_scale_inv")
+        if not hasattr(self.wo_b, "weight_scale_inv"):
+            raise RuntimeError("b12x WO projection requires FP8 wo_b.weight_scale_inv")
+        if getattr(self.wo_a, "weight_scale_inv_is_cutlass_interleaved", False):
+            raise RuntimeError("b12x WO projection requires canonical wo_a scales")
+        if getattr(self.wo_b, "weight_scale_inv_is_cutlass_interleaved", False):
+            raise RuntimeError("b12x WO projection requires canonical wo_b scales")
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            get_fp8_gemm_runner_backend,
+        )
+
+        if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            raise RuntimeError(
+                "b12x WO projection cannot consume FlashInfer TRTLLM-shuffled FP8 weights"
+            )
+
+        from b12x.gemm import pack_wo_projection_fp8_block_scaled_weights_mxfp8
+
+        group_width = self.n_local_heads * self.head_dim // self.n_local_groups
+        wo_a_shape = (self.n_local_groups * self.o_lora_rank, group_width)
+        wo_b_shape = (self.hidden_size, self.n_local_groups * self.o_lora_rank)
+        wo_a_scale_shape = (
+            self.n_local_groups * ((self.o_lora_rank + 127) // 128),
+            (group_width + 127) // 128,
+        )
+        wo_b_scale_shape = (
+            (self.hidden_size + 127) // 128,
+            (self.n_local_groups * self.o_lora_rank + 127) // 128,
+        )
+        if self.wo_a.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"b12x WO projection requires FP8 wo_a.weight, got {self.wo_a.weight.dtype}"
+            )
+        if self.wo_b.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"b12x WO projection requires FP8 wo_b.weight, got {self.wo_b.weight.dtype}"
+            )
+        if tuple(self.wo_a.weight.shape) != wo_a_shape:
+            raise RuntimeError(
+                f"b12x WO projection expected wo_a.weight shape {wo_a_shape}, "
+                f"got {tuple(self.wo_a.weight.shape)}"
+            )
+        if tuple(self.wo_b.weight.shape) != wo_b_shape:
+            raise RuntimeError(
+                f"b12x WO projection expected wo_b.weight shape {wo_b_shape}, "
+                f"got {tuple(self.wo_b.weight.shape)}"
+            )
+        if tuple(self.wo_a.weight_scale_inv.shape) != wo_a_scale_shape:
+            raise RuntimeError(
+                f"b12x WO projection expected wo_a.weight_scale_inv shape {wo_a_scale_shape}, "
+                f"got {tuple(self.wo_a.weight_scale_inv.shape)}"
+            )
+        if tuple(self.wo_b.weight_scale_inv.shape) != wo_b_scale_shape:
+            raise RuntimeError(
+                f"b12x WO projection expected wo_b.weight_scale_inv shape {wo_b_scale_shape}, "
+                f"got {tuple(self.wo_b.weight_scale_inv.shape)}"
+            )
+        self.b12x_wo_projection_weights = (
+            pack_wo_projection_fp8_block_scaled_weights_mxfp8(
+                self.wo_a.weight.detach(),
+                self.wo_a.weight_scale_inv.detach(),
+                self.wo_b.weight.detach(),
+                self.wo_b.weight_scale_inv.detach(),
+                groups=self.n_local_groups,
+                group_width=group_width,
+                rank=self.o_lora_rank,
+                hidden=self.hidden_size,
+            )
+        )
+
+    def _get_b12x_wo_projection_workspace(self, tokens: int):
+        if self.b12x_wo_projection_weights is None:
+            self.setup_b12x_wo_projection()
+        weights = self.b12x_wo_projection_weights
+        if weights is None:
+            raise RuntimeError("b12x WO projection weights were not initialized")
+
+        device = self.wo_a.weight.device
+        device_key = (device.type, device.index if device.index is not None else 0)
+        key = (
+            device_key,
+            int(tokens),
+            weights.groups,
+            weights.group_width,
+            weights.rank,
+            weights.hidden,
+        )
+        workspace = self._b12x_wo_projection_workspace_cache.get(key)
+        if workspace is not None:
+            return workspace
+        if get_is_capture_mode():
+            raise RuntimeError(
+                "b12x WO projection workspace was not prewarmed before CUDA graph capture "
+                f"for tokens={tokens}"
+            )
+
+        from b12x.gemm import empty_wo_projection_workspace
+
+        workspace = empty_wo_projection_workspace(
+            tokens,
+            groups=weights.groups,
+            group_width=weights.group_width,
+            rank=weights.rank,
+            hidden=weights.hidden,
+            device=device,
+        )
+        self._b12x_wo_projection_workspace_cache[key] = workspace
+        return workspace
+
+    def prewarm_b12x_wo_projection_workspaces(self, token_counts: Iterable[int]) -> None:
+        if not _FP8_WO_A_GEMM:
+            return
+        self.setup_b12x_wo_projection()
+        if self.b12x_wo_projection_weights is None:
+            raise RuntimeError("b12x WO projection weights were not initialized")
+
+        from b12x.gemm import wo_projection_mxfp8
+
+        weights = self.b12x_wo_projection_weights
+        device = self.wo_a.weight.device
+        with torch.inference_mode():
+            for tokens in sorted({int(t) for t in token_counts if int(t) > 0}):
+                workspace = self._get_b12x_wo_projection_workspace(tokens)
+                source = torch.zeros(
+                    (tokens, weights.groups, weights.group_width),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+                wo_projection_mxfp8(source, weights, workspace)
+            torch.cuda.synchronize(device)
+
+    def _apply_b12x_wo_projection(
+        self,
+        o: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        workspace = self._get_b12x_wo_projection_workspace(o.shape[0])
+
+        from b12x.gemm import wo_projection_mxfp8
+
+        output = wo_projection_mxfp8(
+            o,
+            self.b12x_wo_projection_weights,
+            workspace,
+        )
+
+        if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
+            if self.wo_b.use_dp_attention_reduce:
+                output = get_attention_tp_group().all_reduce(output)
+            else:
+                quantize_communications = (
+                    not forward_batch.forward_mode.is_decode_or_idle()
+                    and get_global_server_args().enable_quant_communications
+                )
+                if quantize_communications:
+                    output = tensor_model_parallel_quant_all_reduce(output)
+                else:
+                    output = tensor_model_parallel_all_reduce(output)
+        return output
 
     def _compute_q_a(
         self,
@@ -530,33 +744,28 @@ class MQALayer(nn.Module):
             and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
         )
 
-        tp_slice, q_padded, q_out = slice(None), None, None
+        tp_slice = slice(None)
         if self.tp_size > 1:
-            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
             rank = self.tp_rank
             tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
             q, kv = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, q_out
+                x, positions, forward_batch, attn_backend
             )
         else:
-            q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, q_out
-            )
+            q, kv = self._forward_prepare(x, positions, forward_batch, attn_backend)
 
         o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
+            q=q,
             k=kv,
             v=kv,
             layer=self.attn_mqa,
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
-            attn_sink=self.attn_sink,
+            attn_sink=self.attn_sink[tp_slice],
             save_kv_cache=not self.overlap_store_cache,
         )
-        o = o[:, tp_slice, :]
         fused_rope(
             o[..., -self.qk_rope_head_dim :],
             None,
@@ -566,28 +775,11 @@ class MQALayer(nn.Module):
         )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
-
         if _FP8_WO_A_GEMM:
-            import deep_gemm
+            return self._apply_b12x_wo_projection(o, forward_batch)
 
-            T, G, D = o.shape
-            R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
-                group_size=128,
-            )
-            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
-                output,
-                recipe=(1, 1, 128),
-            )
-            o = output
-        else:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
 
@@ -653,6 +845,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        mhc_workspace=None,
     ):
         @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
@@ -667,11 +860,27 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if x.shape[0] == 0:
             y = torch.empty((0, shape[-1]), dtype=dtype, device=x.device)
-            post = torch.empty((0, self.hc_mult), dtype=dtype, device=x.device)
+            post = torch.empty((0, self.hc_mult), dtype=torch.float32, device=x.device)
             comb = torch.empty(
-                (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
+                (0, self.hc_mult, self.hc_mult), dtype=torch.float32, device=x.device
             )
             return y, post, comb
+
+        if envs.SGLANG_OPT_USE_B12X_MHC.get():
+            if mhc_workspace is None:
+                raise RuntimeError("SGLANG_OPT_USE_B12X_MHC requires an arena-backed mHC workspace")
+            from b12x.integration import b12x_mhc_pre
+
+            return b12x_mhc_pre(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                workspace=mhc_workspace,
+            )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
@@ -689,33 +898,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            import deep_gemm
+        x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-            x_flat = x.flatten(1).bfloat16()
-
-            m, k = x_flat.shape
-            mix_hc = hc_fn.size(0)
-            d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
-            s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            deep_gemm.tf32_hc_prenorm_gemm(
-                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
+        @compile_in_capture_mode
+        def hc_split_sinkhorn_torch_impl(mixes, hc_scale, hc_base):
+            return _hc_split_sinkhorn_torch(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
             )
-            rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
-            mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
-        else:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
-
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
+        pre, post, comb = hc_split_sinkhorn_torch_impl(mixes, hc_scale, hc_base)
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1)
 
@@ -725,11 +921,25 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor,
         post: torch.Tensor,
         comb: torch.Tensor,
+        mhc_workspace=None,
     ):
 
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
+            )
+
+        if envs.SGLANG_OPT_USE_B12X_MHC.get():
+            if mhc_workspace is None:
+                raise RuntimeError("SGLANG_OPT_USE_B12X_MHC requires an arena-backed mHC workspace")
+            from b12x.integration import b12x_mhc_post
+
+            return b12x_mhc_post(
+                x,
+                residual,
+                post,
+                comb,
+                workspace=mhc_workspace,
             )
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
@@ -758,9 +968,26 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
+        mhc_workspace = None
+        if envs.SGLANG_OPT_USE_B12X_MHC.get():
+            get_mhc_workspace = getattr(
+                forward_batch.attn_backend,
+                "get_b12x_mhc_workspace",
+                None,
+            )
+            if get_mhc_workspace is None:
+                raise RuntimeError(
+                    "SGLANG_OPT_USE_B12X_MHC requires the DSV4 b12x attention backend"
+                )
+            mhc_workspace = get_mhc_workspace()
+
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            mhc_workspace=mhc_workspace,
         )
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -770,10 +997,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        hidden_states = self.hc_post(
+            hidden_states,
+            residual,
+            post,
+            comb,
+            mhc_workspace=mhc_workspace,
+        )
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            mhc_workspace=mhc_workspace,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
@@ -823,7 +1060,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        hidden_states = self.hc_post(
+            hidden_states,
+            residual,
+            post,
+            comb,
+            mhc_workspace=mhc_workspace,
+        )
 
         return hidden_states
 
@@ -987,6 +1230,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.nsa_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()
+        self._b12x_wo_projection_workspace_cache = {}
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1025,7 +1269,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     metadata = forward_batch.attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
+                    core_meta.init_sparse_mla_related()
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
                             forward_batch.attn_backend.init_forward_metadata_indexer(
@@ -1051,24 +1295,35 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
-        from deep_gemm import transform_sf_into_required_layout
-
-        layers = self.model.layers
+        if not hasattr(self, "_b12x_wo_projection_workspace_cache"):
+            self._b12x_wo_projection_workspace_cache = {}
+        if is_nextn:
+            model_layers = [self.model.decoder] if hasattr(self.model, "decoder") else []
+        else:
+            model_layers = self.model.layers
+        layers = [layer for layer in model_layers if hasattr(layer, "self_attn")]
         for layer in layers:
-            attn = layer.self_attn
-            G = attn.n_local_groups
-            R = attn.o_lora_rank
-            D = attn.wo_a.weight.shape[1]
-
-            raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
-            attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
-                raw_scale,
-                mn=R,
-                k=D,
-                recipe=(1, 128, 128),
-                num_groups=G,
-                is_sfa=False,
+            self_attn = layer.self_attn
+            self_attn.set_b12x_wo_projection_workspace_cache(
+                self._b12x_wo_projection_workspace_cache
             )
+            self_attn.setup_b12x_wo_projection()
+
+        token_counts = set()
+        server_args = get_global_server_args()
+        if server_args.cuda_graph_bs is not None:
+            graph_batch_sizes = [int(bs) for bs in server_args.cuda_graph_bs]
+            token_counts.update(bs for bs in graph_batch_sizes if bs > 0)
+            draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None)
+            if draft_tokens is not None and int(draft_tokens) > 0:
+                token_counts.update(
+                    bs * int(draft_tokens) for bs in graph_batch_sizes if bs > 0
+                )
+        chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
+        if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
+            token_counts.add(int(chunked_prefill_size))
+        if layers and token_counts:
+            layers[0].self_attn.prewarm_b12x_wo_projection_workspaces(token_counts)
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if _FP8_WO_A_GEMM:
@@ -1163,7 +1418,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if not _FP8_WO_A_GEMM:
             weights = list(weights)
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:

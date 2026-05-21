@@ -1,5 +1,6 @@
 import ctypes
 import glob
+import importlib.metadata as importlib_metadata
 import importlib.util
 import logging
 import os
@@ -45,6 +46,36 @@ def _filter_compiled_extensions(file_list):
     return compiled_files + other_files
 
 
+def _get_sgl_kernel_dirs():
+    """Return candidate package directories, preferring installed binary artifacts."""
+    source_dir = Path(__file__).parent
+    candidates = []
+
+    try:
+        installed_dir = Path(
+            importlib_metadata.distribution("sglang-kernel").locate_file("sgl_kernel")
+        )
+        if installed_dir.exists():
+            candidates.append(installed_dir)
+    except importlib_metadata.PackageNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug(f"[sgl_kernel] Failed to locate installed package dir: {e}")
+
+    candidates.append(source_dir)
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
 def _load_architecture_specific_ops():
     """Load the appropriate common_ops library based on GPU architecture."""
     compute_capability = _get_compute_capability()
@@ -52,9 +83,9 @@ def _load_architecture_specific_ops():
         f"[sgl_kernel] GPU Detection: compute_capability = {compute_capability}"
     )
 
-    # Get the directory where sgl_kernel is installed
-    sgl_kernel_dir = Path(__file__).parent
-    logger.debug(f"[sgl_kernel] sgl_kernel directory: {sgl_kernel_dir}")
+    # Get candidate directories where sgl_kernel artifacts may be installed.
+    sgl_kernel_dirs = _get_sgl_kernel_dirs()
+    logger.debug(f"[sgl_kernel] sgl_kernel directories: {sgl_kernel_dirs}")
 
     # Determine which version to load based on GPU architecture
     if compute_capability == 90:
@@ -69,20 +100,31 @@ def _load_architecture_specific_ops():
 
     # Look for the compiled module with any valid extension
 
-    ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
-    raw_matching_files = glob.glob(ops_pattern)
-    matching_files = _filter_compiled_extensions(raw_matching_files)
-
     logger.debug(f"[sgl_kernel] Attempting to load {variant_name}")
-    logger.debug(f"[sgl_kernel] Looking for library matching pattern: {ops_pattern}")
-    logger.debug(f"[sgl_kernel] Found files: {raw_matching_files}")
-    logger.debug(f"[sgl_kernel] Prioritized files: {matching_files}")
 
     previous_import_errors: List[Exception] = []
+    ops_attempts = []
 
     # Try to load from the architecture-specific directory
-    if matching_files:
-        ops_path = Path(matching_files[0])  # Use the first prioritized file
+    for sgl_kernel_dir in sgl_kernel_dirs:
+        ops_pattern = str(sgl_kernel_dir / ops_subdir / "common_ops.*")
+        raw_matching_files = glob.glob(ops_pattern)
+        matching_files = _filter_compiled_extensions(raw_matching_files)
+        ops_attempts.append((ops_pattern, matching_files))
+
+        logger.debug(
+            f"[sgl_kernel] Looking for library matching pattern: {ops_pattern}"
+        )
+        logger.debug(f"[sgl_kernel] Found files: {raw_matching_files}")
+        logger.debug(f"[sgl_kernel] Prioritized files: {matching_files}")
+
+        if not matching_files:
+            logger.debug(
+                f"[sgl_kernel] ✗ Architecture-specific library not found matching pattern: {ops_pattern}"
+            )
+            continue
+
+        ops_path = Path(matching_files[0])
         logger.debug(f"[sgl_kernel] Found architecture-specific library: {ops_path}")
         try:
             # Load the module from specific path using importlib
@@ -106,21 +148,28 @@ def _load_architecture_specific_ops():
                 f"[sgl_kernel] ✗ Failed to load from {ops_path}: {type(e).__name__}: {e}"
             )
             # Continue to fallback
-    else:
-        logger.debug(
-            f"[sgl_kernel] ✗ Architecture-specific library not found matching pattern: {ops_pattern}"
-        )
 
     # Try alternative directory (in case installation structure differs)
-    alt_pattern = str(sgl_kernel_dir / "common_ops.*")
-    raw_alt_files = glob.glob(alt_pattern)
-    alt_matching_files = _filter_compiled_extensions(raw_alt_files)
-    logger.debug(f"[sgl_kernel] Attempting fallback: looking for pattern {alt_pattern}")
-    logger.debug(f"[sgl_kernel] Found fallback files: {raw_alt_files}")
-    logger.debug(f"[sgl_kernel] Prioritized fallback files: {alt_matching_files}")
+    alt_attempts = []
+    for sgl_kernel_dir in sgl_kernel_dirs:
+        alt_pattern = str(sgl_kernel_dir / "common_ops.*")
+        raw_alt_files = glob.glob(alt_pattern)
+        alt_matching_files = _filter_compiled_extensions(raw_alt_files)
+        alt_attempts.append((alt_pattern, alt_matching_files))
 
-    if alt_matching_files:
-        alt_path = Path(alt_matching_files[0])  # Use the first prioritized file
+        logger.debug(
+            f"[sgl_kernel] Attempting fallback: looking for pattern {alt_pattern}"
+        )
+        logger.debug(f"[sgl_kernel] Found fallback files: {raw_alt_files}")
+        logger.debug(f"[sgl_kernel] Prioritized fallback files: {alt_matching_files}")
+
+        if not alt_matching_files:
+            logger.debug(
+                f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
+            )
+            continue
+
+        alt_path = Path(alt_matching_files[0])
         logger.debug(f"[sgl_kernel] Found fallback library: {alt_path}")
         try:
             spec = importlib.util.spec_from_file_location("common_ops", str(alt_path))
@@ -142,10 +191,6 @@ def _load_architecture_specific_ops():
             logger.debug(
                 f"[sgl_kernel] ✗ Failed to load fallback from {alt_path}: {type(e).__name__}: {e}"
             )
-    else:
-        logger.debug(
-            f"[sgl_kernel] ✗ Fallback library not found matching pattern: {alt_pattern}"
-        )
 
     # Final attempt: try standard Python import (for backward compatibility)
     logger.debug(
@@ -166,6 +211,12 @@ def _load_architecture_specific_ops():
     )
 
     # All attempts failed
+    ops_attempt_summary = "\n".join(
+        f"- {pattern} - found files: {matches}" for pattern, matches in ops_attempts
+    )
+    alt_attempt_summary = "\n".join(
+        f"- {pattern} - found files: {matches}" for pattern, matches in alt_attempts
+    )
     cuda_version = torch.version.cuda
     if cuda_version and cuda_version.startswith("12"):
         install_hint = (
@@ -178,8 +229,10 @@ def _load_architecture_specific_ops():
 [sgl_kernel] CRITICAL: Could not load any common_ops library!
 
 Attempted locations:
-1. Architecture-specific pattern: {ops_pattern} - found files: {matching_files}
-2. Fallback pattern: {alt_pattern} - found files: {alt_matching_files}
+1. Architecture-specific patterns:
+{ops_attempt_summary}
+2. Fallback patterns:
+{alt_attempt_summary}
 3. Standard Python import: common_ops - failed
 
 GPU Info:
