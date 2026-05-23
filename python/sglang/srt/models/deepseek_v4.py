@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     add_prefix,
     log_info_on_rank0,
     make_layers,
+    set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -279,6 +280,12 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        set_weight_attrs(
+            self.attn_sink,
+            {
+                "weight_loader": self._load_attn_sink,
+            },
+        )
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -360,6 +367,15 @@ class MQALayer(nn.Module):
 
         self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
         self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
+
+    @staticmethod
+    def _load_attn_sink(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        if param.data.shape == loaded_weight.shape:
+            param.data.copy_(loaded_weight)
+            return
+        param.data.zero_()
+        copy_size = min(param.data.numel(), loaded_weight.numel())
+        param.data.reshape(-1)[:copy_size].copy_(loaded_weight.reshape(-1)[:copy_size])
 
     def set_b12x_wo_projection_workspace_cache(self, cache) -> None:
         self._b12x_wo_projection_workspace_cache = cache

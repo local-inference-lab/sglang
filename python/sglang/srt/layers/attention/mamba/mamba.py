@@ -31,7 +31,6 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.utils import (
-    is_cpu,
     is_cuda,
     is_npu,
     set_weight_attrs,
@@ -77,29 +76,29 @@ def mamba_v2_sharded_weight_loader(
         # - track boundary of (sharded) param, and loaded_weight, respectively
         boundary, loaded_boundary = 0, 0
 
-        # Calculate padding size for CPU when TP odd size
-        if is_cpu():
-            full_dim_sum = 0
-            full_dim_list = []
-            weight_full_dim_list = []
-            for full_dim, _, _ in shard_spec:
-                full_dim_sum = full_dim_sum + full_dim
-                full_dim_list.append(full_dim)
-            for full_dim in full_dim_list:
-                weight_full_dim_list.append(
-                    int(full_dim / full_dim_sum * loaded_weight.size(0))
-                )
-            assert sum(weight_full_dim_list) == loaded_weight.size(
-                0
-            ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
-            if loaded_weight.size(0) < full_dim_sum and tp_rank == 0:
+        logical_full_dims = [full_dim - extra for full_dim, extra, _ in shard_spec]
+        logical_full_dim_sum = sum(logical_full_dims)
+        loaded_full_dims = logical_full_dims
+        requires_padding = loaded_weight.size(0) < logical_full_dim_sum
+        if loaded_weight.size(0) != logical_full_dim_sum:
+            loaded_full_dims = [
+                int(full_dim / logical_full_dim_sum * loaded_weight.size(0))
+                for full_dim in logical_full_dims
+            ]
+            assert sum(loaded_full_dims) == loaded_weight.size(0), (
+                f"Padding the loaded weight failed due to sizes are not divisible cleanly from {loaded_full_dims} to {loaded_weight.size(0)}"
+            )
+            if requires_padding and tp_rank == 0:
                 logger.warning(
-                    f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
-                    f", where original sizes of {weight_full_dim_list} will be updated to {full_dim_list}",
+                    f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {logical_full_dim_sum}"
+                    f", where original sizes of {loaded_full_dims} will be updated to {logical_full_dims}",
                 )
 
+        if requires_padding:
+            param.data.zero_()
+
         # - iterate over the shard specs
-        for full_dim, extra, duplicate_groups in shard_spec:
+        for idx, (full_dim, extra, duplicate_groups) in enumerate(shard_spec):
             # - full dim is the model dim (before TP).
             # - extra > 0, means there is expected overall increase
             #   of dimensions. This is so because of replication.
@@ -122,48 +121,25 @@ def mamba_v2_sharded_weight_loader(
             loaded_start_idx = loaded_boundary + loaded_skip
 
             # - take these many dims from the loaded weight.
-            take = min(shard_size, full_dim - extra - loaded_skip)
-
-            # CPU logic of padding size for qwen3-next
-            # TODO : make this common for all mamba.
-            if is_cpu() and (loaded_weight.size(0) < full_dim_sum):
-                import copy
-
-                loaded_weight_ = copy.deepcopy(loaded_weight)
-                q, k, v = torch.split(
-                    loaded_weight_,
-                    weight_full_dim_list,
-                    dim=0,
-                )
-                pad_qk = torch.zeros(
-                    full_dim_list[0] - weight_full_dim_list[0],
-                    loaded_weight.size(1),
-                    loaded_weight.size(2),
-                ).to(loaded_weight.dtype)
-                pad_v = torch.zeros(
-                    full_dim_list[2] - weight_full_dim_list[2],
-                    loaded_weight.size(1),
-                    loaded_weight.size(2),
-                ).to(loaded_weight.dtype)
-                q = torch.cat((q, pad_qk), dim=0)
-                k = torch.cat((k, pad_qk), dim=0)
-                v = torch.cat((v, pad_v), dim=0)
-                loaded_weight_qk = torch.cat((q, k), dim=0)
-                loaded_weight = torch.cat((loaded_weight_qk, v), dim=0)
+            loaded_full_dim = loaded_full_dims[idx]
+            take = min(shard_size, max(0, loaded_full_dim - loaded_skip))
 
             # - always shard on dim 0
             # - the ignore is for a mundane mypy error as it does not
             #   seem to handle slices well.
             # https://github.com/python/mypy/issues/2410
-            param.data[
-                boundary : (boundary + take), ...  # type: ignore[misc]
-            ] = loaded_weight[
-                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
-            ]  # type: ignore[misc]
+            if take > 0:
+                param.data[
+                    boundary : (boundary + take), ...  # type: ignore[misc]
+                ] = loaded_weight[
+                    loaded_start_idx : (
+                        loaded_start_idx + take
+                    )  # type: ignore[misc]
+                ]  # type: ignore[misc]
 
             # move indexing boundaries
             boundary += shard_size
-            loaded_boundary += full_dim - extra
+            loaded_boundary += loaded_full_dim
 
     return loader
 

@@ -339,8 +339,21 @@ class FusedMoE(torch.nn.Module):
             and hasattr(self, "w2_weight")
             and getattr(self.w2_weight, "weight_padded", False)
         )
+        try:
+            server_args = get_global_server_args()
+        except ValueError:
+            server_args = None
+        b12x_virtual_padded = (
+            get_moe_runner_backend().is_b12x()
+            and getattr(server_args, "virtual_tp_sharding", "off") == "b12x-padded"
+        )
 
-        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+        return (
+            _is_cpu
+            or self.use_flashinfer_trtllm_moe
+            or aiter_padded
+            or b12x_virtual_padded
+        )
 
     def _load_per_tensor_weight_scale(
         self,

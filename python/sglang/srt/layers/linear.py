@@ -421,9 +421,14 @@ class ColumnParallelLinear(LinearBase):
                 )
             else:
                 if not self.use_presharded_weights:
-                    loaded_weight = loaded_weight.narrow(
-                        output_dim, start_idx, shard_size
-                    )
+                    if loaded_weight.shape[output_dim] < start_idx + shard_size:
+                        loaded_weight = pad_or_narrow_weight(
+                            loaded_weight, output_dim, start_idx, shard_size
+                        )
+                    else:
+                        loaded_weight = loaded_weight.narrow(
+                            output_dim, start_idx, shard_size
+                        )
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
@@ -1226,9 +1231,14 @@ class QKVParallelLinear(ColumnParallelLinear):
                     )
 
                 if not self.use_presharded_weights:
-                    loaded_weight_shard = loaded_weight.narrow(
-                        output_dim, shard_offset, shard_size
-                    )
+                    if loaded_weight.shape[output_dim] < shard_offset + shard_size:
+                        loaded_weight_shard = pad_or_narrow_weight(
+                            loaded_weight, output_dim, shard_offset, shard_size
+                        )
+                    else:
+                        loaded_weight_shard = loaded_weight.narrow(
+                            output_dim, shard_offset, shard_size
+                        )
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
 
@@ -1305,9 +1315,14 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # bitsandbytes loads the weights of the specific portion
                 # no need to narrow here
                 if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                    loaded_weight = loaded_weight.narrow(
-                        output_dim, start_idx, shard_size
-                    )
+                    if loaded_weight.shape[output_dim] < start_idx + shard_size:
+                        loaded_weight = pad_or_narrow_weight(
+                            loaded_weight, output_dim, start_idx, shard_size
+                        )
+                    else:
+                        loaded_weight = loaded_weight.narrow(
+                            output_dim, start_idx, shard_size
+                        )
 
         # Special case for AQLM codebooks.
         elif is_metadata:

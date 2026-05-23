@@ -142,6 +142,29 @@ class TestMakePackedWeightLoader(unittest.TestCase):
         self.assertEqual(calls[1][1].shape[0], 128)
         self.assertEqual(calls[2][1].shape[0], 64)
 
+    def test_virtual_output_sizes_split_checkpoint_proportionally(self):
+        """Virtual padded output sizes should split the smaller checkpoint tensor."""
+        module = _make_mock_module(output_sizes=[20, 20, 40])
+        param = MagicMock()
+        param.output_dim = 0
+
+        calls = []
+
+        def original_loader(p, chunk, shard_id):
+            calls.append((shard_id, chunk.clone()))
+
+        loader = Qwen3_5GatedDeltaNet._make_packed_weight_loader(
+            module, original_loader
+        )
+
+        weight = torch.randn(16 + 16 + 32, 256)
+        loader(param, weight, loaded_shard_id=(0, 1, 2))
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][1].shape[0], 16)
+        self.assertEqual(calls[1][1].shape[0], 16)
+        self.assertEqual(calls[2][1].shape[0], 32)
+
     # ------------------------------------------------------------------ #
     #  Passthrough for non-tuple shard_id                                 #
     # ------------------------------------------------------------------ #

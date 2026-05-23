@@ -326,18 +326,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     chunks = [loaded_weight.view(-1)] * len(loaded_shard_id)
                 else:
                     split_dim = getattr(param, "output_dim", 0)
-                    if _is_cpu:
-                        cpu_split_sizes = []
+                    if _is_cpu or loaded_weight.size(split_dim) != sum(split_sizes):
+                        checkpoint_split_sizes = []
                         split_size_sum = sum(split_sizes)
                         target_size_sim = loaded_weight.size(split_dim)
                         for i in range(len(split_sizes)):
-                            cpu_split_sizes.append(
+                            checkpoint_split_sizes.append(
                                 int(target_size_sim * split_sizes[i] / split_size_sum)
                             )
-                        assert (
-                            sum(cpu_split_sizes) == target_size_sim
-                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
-                        chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
+                        assert sum(checkpoint_split_sizes) == target_size_sim, (
+                            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {checkpoint_split_sizes} to {target_size_sim}"
+                        )
+                        chunks = loaded_weight.split(
+                            checkpoint_split_sizes, dim=split_dim
+                        )
                     else:
                         chunks = loaded_weight.split(split_sizes, dim=split_dim)
 

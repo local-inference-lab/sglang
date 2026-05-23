@@ -436,6 +436,8 @@ class ServerArgs:
     # Runtime options
     device: Optional[str] = None
     tp_size: int = 1
+    virtual_tp_sharding: str = "off"
+    virtual_tp_moe_alignment: int = 128
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
@@ -4888,6 +4890,34 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tp_size,
             help="The tensor parallelism size.",
+        )
+        parser.add_argument(
+            "--virtual-tp-sharding",
+            type=str,
+            choices=["off", "b12x-padded"],
+            default=ServerArgs.virtual_tp_sharding,
+            help=(
+                "Opt-in virtual tensor-parallel sharding policy. "
+                "'b12x-padded' pads selected model config dimensions and "
+                "zero-fills checkpoint tails so odd TP sizes can be used with "
+                "b12x attention/MoE backends."
+            ),
+        )
+        parser.add_argument(
+            "--b12x-allow-odd-tp",
+            action="store_const",
+            dest="virtual_tp_sharding",
+            const="b12x-padded",
+            help="Alias for --virtual-tp-sharding=b12x-padded.",
+        )
+        parser.add_argument(
+            "--virtual-tp-moe-alignment",
+            type=int,
+            default=ServerArgs.virtual_tp_moe_alignment,
+            help=(
+                "Local N alignment used when --virtual-tp-sharding=b12x-padded "
+                "pads MoE/intermediate dimensions. Default is 128."
+            ),
         )
         parser.add_argument(
             "--attention-context-parallel-size",

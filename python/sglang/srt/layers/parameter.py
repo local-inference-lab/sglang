@@ -166,9 +166,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 param_data.copy_(loaded_weight)
                 return
             else:
-                loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
-                )
+                start_idx = tp_rank * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.output_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, self.output_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        self.output_dim, start_idx, shard_size
+                    )
 
         copy_with_check(self.data, loaded_weight)
 
@@ -262,9 +269,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             )
         else:
             if not use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(
-                    self.output_dim, shard_id * shard_size, shard_size
-                )
+                start_idx = shard_id * shard_size
+                end_idx = start_idx + shard_size
+                if end_idx > loaded_weight.shape[self.output_dim]:
+                    loaded_weight = pad_or_narrow_weight(
+                        loaded_weight, self.output_dim, start_idx, shard_size
+                    )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        self.output_dim, start_idx, shard_size
+                    )
 
         assert (
             param_data.shape == loaded_weight.shape

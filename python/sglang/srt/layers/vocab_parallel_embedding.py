@@ -54,6 +54,17 @@ def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) ->
     return ((vocab_size + pad_to - 1) // pad_to) * pad_to
 
 
+def _is_virtual_tp_padded_enabled() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except ValueError:
+        return False
+
+    return getattr(server_args, "virtual_tp_sharding", "off") == "b12x-padded"
+
+
 def vocab_range_from_per_partition_vocab_size(
     per_partition_vocab_size: int, rank: int, offset: int = 0
 ) -> Sequence[int]:
@@ -233,7 +244,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Support the case where the vocab size is not divisible by the TP size.
         if (
-            _is_cpu
+            (_is_cpu or _is_virtual_tp_padded_enabled())
             and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
         ):
             padding_size *= self.tp_size

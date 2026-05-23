@@ -62,6 +62,10 @@ from sglang.srt.configs.model_config import (
     get_num_indexer_layers,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.configs.virtual_tp import (
+    VIRTUAL_TP_SHARDING_B12X_PADDED,
+    adjust_config_with_b12x_virtual_tp_sharding,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
@@ -1403,7 +1407,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
         )
-        if self.device == "cpu":
+        if self.server_args.virtual_tp_sharding == VIRTUAL_TP_SHARDING_B12X_PADDED:
+            if self.device != "cuda":
+                raise ValueError(
+                    "--virtual-tp-sharding=b12x-padded is only supported on CUDA."
+                )
+            prefill_backend, decode_backend = self.server_args.get_attention_backends()
+            uses_padded_attention = prefill_backend in {
+                "b12x",
+                "dsv4",
+            } or decode_backend in {"b12x", "dsv4"}
+            uses_b12x_moe = self.server_args.moe_runner_backend == "b12x"
+            attention_tp_size = (
+                self.tp_size
+                // self.server_args.dp_size
+                // self.server_args.attn_cp_size
+            )
+            moe_tp_size = (
+                self.tp_size // self.server_args.ep_size // self.server_args.moe_dp_size
+            )
+            self.model_config = adjust_config_with_b12x_virtual_tp_sharding(
+                self.model_config,
+                self.load_config,
+                attention_tp_size,
+                moe_tp_size,
+                uses_b12x_attention=uses_padded_attention,
+                uses_b12x_moe=uses_b12x_moe,
+                moe_local_n_alignment=self.server_args.virtual_tp_moe_alignment,
+            )
+        elif self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
             )

@@ -1414,6 +1414,18 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
             )
             return default_weight_loader(param_data, loaded_weight)
         else:
+            end_idx = start_idx + shard_size
+            if end_idx > loaded_weight.size(shard_axis):
+                param_data = param.data
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    shard_axis,
+                    shard_size,
+                )
+                return default_weight_loader(param_data, loaded_weight)
             loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
             return default_weight_loader(param, loaded_weight)
 

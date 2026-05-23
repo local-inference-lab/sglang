@@ -69,7 +69,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, pad_or_narrow_weight
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -277,10 +277,18 @@ def rms_apply_serial(
 class MiniMaxM2RMSNormTP(nn.Module):
     """RMSNorm with Tensor Parallel support for QK normalization."""
 
-    def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        original_num_heads: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.total_num_heads = num_heads
+        self.original_num_heads = original_num_heads or num_heads
 
         # Align with QKVParallelLinear pattern
         if self.attn_tp_size >= num_heads:
@@ -297,6 +305,18 @@ class MiniMaxM2RMSNormTP(nn.Module):
             self.num_head_replicas = 1
 
         self.head_dim = hidden_size // num_heads
+        self.shard_id = self.attn_tp_rank // self.num_head_replicas
+        self.local_head_start = self.shard_id * self.num_heads
+        self.valid_num_heads = max(
+            0,
+            min(
+                self.num_heads,
+                self.original_num_heads - self.local_head_start,
+            ),
+        )
+        self.valid_hidden_size = self.valid_num_heads * self.head_dim
+        self.original_hidden_size = self.original_num_heads * self.head_dim
+        self.use_valid_aware_norm = self.original_num_heads != self.total_num_heads
 
         # Weight parameter is sharded across TP ranks
         self.weight = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
@@ -309,16 +329,16 @@ class MiniMaxM2RMSNormTP(nn.Module):
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
-        shard_id = self.attn_tp_rank // self.num_head_replicas
         shard_size = param.data.shape[0]
-        shard_end = (shard_id + 1) * shard_size
-        assert shard_end <= loaded_weight.shape[0], (
-            f"Weight shard out of bounds: shard [{shard_id * shard_size}:{shard_end}] "
-            f"exceeds loaded_weight size {loaded_weight.shape[0]} "
-            f"(attn_tp_rank={self.attn_tp_rank}, num_head_replicas={self.num_head_replicas})"
-        )
-        shard = slice(shard_id * shard_size, shard_end)
-        param.data.copy_(loaded_weight[shard])
+        start_idx = self.shard_id * shard_size
+        shard_end = start_idx + shard_size
+        if shard_end > loaded_weight.shape[0]:
+            loaded_weight = pad_or_narrow_weight(
+                loaded_weight, 0, start_idx, shard_size
+            )
+        else:
+            loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
+        param.data.copy_(loaded_weight)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward(
@@ -333,11 +353,28 @@ class MiniMaxM2RMSNormTP(nn.Module):
         x = x.to(torch.float32)
 
         # Compute variance across the full dimension (not just local shard)
-        variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
+        if self.use_valid_aware_norm:
+            valid_hidden_size = self.valid_hidden_size
+            if valid_hidden_size > 0:
+                sum_sq = (
+                    x[..., :valid_hidden_size]
+                    .pow(2)
+                    .sum(dim=-1, keepdim=True, dtype=torch.float32)
+                )
+            else:
+                sum_sq = torch.zeros(
+                    (*x.shape[:-1], 1), dtype=torch.float32, device=x.device
+                )
 
-        if self.attn_tp_size > 1:
-            # All-reduce variance across TP ranks to get global variance
-            variance = attn_tp_all_reduce(variance) / self.attn_tp_size
+            if self.attn_tp_size > 1:
+                sum_sq = attn_tp_all_reduce(sum_sq)
+            variance = sum_sq / self.original_hidden_size
+        else:
+            variance = x.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32)
+
+            if self.attn_tp_size > 1:
+                # All-reduce variance across TP ranks to get global variance
+                variance = attn_tp_all_reduce(variance) / self.attn_tp_size
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -380,9 +417,21 @@ class MiniMaxM2QKRMSNorm:
         self._world_size = self._q_norm.attn_tp_size
         self._eps = q_norm.variance_epsilon
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
+        self._use_valid_aware_norm = (
+            q_norm.use_valid_aware_norm or k_norm.use_valid_aware_norm
+        )
 
-        self._forward_impl = self._forward_naive
-        if self._world_size > 1 and _is_cuda and use_fused_norm:
+        self._forward_impl = (
+            self._forward_valid_aware
+            if self._use_valid_aware_norm
+            else self._forward_naive
+        )
+        if (
+            self._world_size > 1
+            and _is_cuda
+            and use_fused_norm
+            and not self._use_valid_aware_norm
+        ):
             occupancy = get_fused_parallel_qknorm_max_occupancy(
                 q_norm.weight.dtype,
                 self._world_size,
@@ -443,6 +492,9 @@ class MiniMaxM2QKRMSNorm:
             self._world_size,
             self._eps,
         )
+
+    def _forward_valid_aware(self, q: torch.Tensor, k: torch.Tensor):
+        return self._q_norm(q.contiguous()), self._k_norm(k.contiguous())
 
     def _forward_fused(self, q: torch.Tensor, k: torch.Tensor):
         fused_tp_qknorm(
@@ -778,15 +830,23 @@ class MiniMaxM2Attention(nn.Module):
             if self.qk_norm_type == "per_layer":
                 # Use RMSNormTP for proper tensor parallel support
                 # Use total dimensions (before TP sharding) for correct normalization
+                original_num_heads = getattr(
+                    config, "original_num_attention_heads", self.total_num_heads
+                )
+                original_num_kv_heads = getattr(
+                    config, "original_total_num_kv_heads", self.total_num_kv_heads
+                )
                 self.q_norm = MiniMaxM2RMSNormTP(
                     self.total_num_heads * self.head_dim,
                     num_heads=self.total_num_heads,
                     eps=config.rms_norm_eps,
+                    original_num_heads=original_num_heads,
                 )
                 self.k_norm = MiniMaxM2RMSNormTP(
                     self.total_num_kv_heads * self.head_dim,
                     num_heads=self.total_num_kv_heads,
                     eps=config.rms_norm_eps,
+                    original_num_heads=original_num_kv_heads,
                 )
                 self.qk_norm_impl = MiniMaxM2QKRMSNorm(self.q_norm, self.k_norm)
             else:
