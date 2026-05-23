@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -122,6 +122,138 @@ if _use_aiter:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+_B12X_BLOCK_FP8_LINEAR_PREWARMED: Set[
+    Tuple[Tuple[str, int], int, int, torch.dtype, Tuple[int, ...]]
+] = set()
+
+
+def _b12x_fp4_source_scale_dtype() -> torch.dtype:
+    dtype = getattr(torch, "float8_e8m0fnu", None)
+    if dtype is None:
+        raise RuntimeError("b12x FP4 source scales require torch.float8_e8m0fnu")
+    return dtype
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _empty_e4m3_tensor(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+    storage = torch.empty(shape, dtype=torch.uint8, device=device)
+    storage.zero_()
+    return storage.view(torch.float8_e4m3fn)
+
+
+def _to_e4m3_scale_chunk(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.float8_e4m3fn:
+        return scale
+    if scale.dtype == torch.float32:
+        return scale.to(torch.float8_e4m3fn)
+    return scale.to(torch.float32).to(torch.float8_e4m3fn)
+
+
+def _expand_and_swizzle_b12x_fp4_scale(
+    scale: torch.Tensor,
+    *,
+    expected_cols: int,
+    name: str,
+) -> torch.Tensor:
+    if scale.ndim == 2:
+        scale = scale.unsqueeze(0)
+        squeeze_batch = True
+    elif scale.ndim == 3:
+        squeeze_batch = False
+    else:
+        raise ValueError(f"{name} must be 2D or 3D, got {tuple(scale.shape)}")
+
+    batch, rows, source_cols = (int(dim) for dim in scale.shape)
+    if source_cols == expected_cols // 2 and expected_cols % 2 == 0:
+        expand_native_cols = True
+    elif source_cols == expected_cols:
+        expand_native_cols = False
+    else:
+        raise ValueError(
+            f"{name} has {source_cols} scale columns, expected "
+            f"{expected_cols // 2} native-FP4 or {expected_cols} W4A16 columns"
+        )
+
+    rows_padded = _align_up(rows, 128)
+    cols_padded = _align_up(expected_cols, 4)
+    swizzled = _empty_e4m3_tensor((batch, rows_padded, cols_padded), scale.device)
+    swizzled_view = swizzled.reshape(
+        batch,
+        rows_padded // 128,
+        cols_padded // 4,
+        32,
+        4,
+        4,
+    )
+
+    block_storage = torch.empty(
+        (128, cols_padded), dtype=torch.uint8, device=scale.device
+    )
+    block = block_storage.view(torch.float8_e4m3fn)
+    for expert in range(batch):
+        expert_scale = scale[expert]
+        for block_id, row_start in enumerate(range(0, rows_padded, 128)):
+            row_end = min(row_start + 128, rows)
+            valid_rows = max(row_end - row_start, 0)
+            block_storage.zero_()
+            if valid_rows:
+                source = expert_scale[row_start:row_end]
+                source = _to_e4m3_scale_chunk(source)
+                if expand_native_cols:
+                    block[:valid_rows, :expected_cols:2].copy_(source)
+                    block[:valid_rows, 1:expected_cols:2].copy_(source)
+                else:
+                    block[:valid_rows, :expected_cols].copy_(source)
+            swizzled_view[expert, block_id].copy_(
+                block.reshape(4, 32, cols_padded // 4, 4).permute(2, 1, 0, 3)
+            )
+
+    return swizzled[0] if squeeze_batch else swizzled
+
+
+def _planned_b12x_block_fp8_token_counts(
+    *, include_chunked_prefill: bool
+) -> Tuple[int, ...]:
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return ()
+
+    token_counts = set()
+    graph_batch_sizes = []
+    cuda_graph_bs = getattr(server_args, "cuda_graph_bs", None)
+    if cuda_graph_bs is not None:
+        graph_batch_sizes = [int(bs) for bs in cuda_graph_bs if int(bs) > 0]
+        token_counts.update(graph_batch_sizes)
+
+    draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None)
+    if draft_tokens is not None and int(draft_tokens) > 0:
+        token_counts.update(bs * int(draft_tokens) for bs in graph_batch_sizes)
+
+    if include_chunked_prefill:
+        chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
+        if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
+            token_counts.add(int(chunked_prefill_size))
+
+    return tuple(sorted(token_counts))
+
+
+def _b12x_block_fp8_output_dtype(layer: Module) -> torch.dtype:
+    dtype = getattr(layer, "orig_dtype", None)
+    if dtype in (torch.bfloat16, torch.float16):
+        return dtype
+    return torch.bfloat16
+
+
+def _b12x_block_fp8_uses_chunked_prefill(layer: Module) -> bool:
+    # Prefill logits are computed from pruned hidden states, not every chunk row.
+    return layer.__class__.__name__ != "ParallelLMHead"
 
 
 class Fp8Config(QuantizationConfig):
@@ -485,9 +617,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             layer.input_scale = None
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["weight"])
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
@@ -541,7 +673,10 @@ class Fp8LinearMethod(LinearMethodBase):
             and get_fp8_gemm_runner_backend().is_b12x()
             and not getattr(layer, "b12x_skip_generic_block_fp8_linear", False)
         ):
-            from b12x.gemm import pack_block_fp8_linear_weight_mxfp8
+            from b12x.gemm import (
+                pack_block_fp8_linear_weight_mxfp8,
+                prewarm_block_fp8_linear_mxfp8,
+            )
 
             packed_weight = pack_block_fp8_linear_weight_mxfp8(
                 layer.weight.detach(),
@@ -550,6 +685,34 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             layer.b12x_block_fp8_linear_weight = packed_weight
             layer.weight.b12x_block_fp8_linear_weight = packed_weight
+            token_counts = _planned_b12x_block_fp8_token_counts(
+                include_chunked_prefill=_b12x_block_fp8_uses_chunked_prefill(layer)
+            )
+            if token_counts:
+                device = packed_weight.weight.values.device
+                device_index = device.index if device.index is not None else 0
+                output_dtype = _b12x_block_fp8_output_dtype(layer)
+                prewarm_key = (
+                    (device.type, int(device_index)),
+                    int(packed_weight.in_features),
+                    int(packed_weight.out_features),
+                    output_dtype,
+                    token_counts,
+                )
+                if prewarm_key not in _B12X_BLOCK_FP8_LINEAR_PREWARMED:
+                    prewarm_block_fp8_linear_mxfp8(
+                        packed_weight,
+                        token_counts,
+                        output_dtype=output_dtype,
+                    )
+                    _B12X_BLOCK_FP8_LINEAR_PREWARMED.add(prewarm_key)
+                    logger.info(
+                        "Prewarmed b12x block FP8 linear shape N=%s K=%s dtype=%s tokens=%s",
+                        packed_weight.out_features,
+                        packed_weight.in_features,
+                        output_dtype,
+                        list(token_counts),
+                    )
 
         if (
             _use_aiter_bpreshuffle_gfx95
@@ -858,9 +1021,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
-            assert (
-                cutlass_fp8_supported()
-            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert cutlass_fp8_supported(), (
+                "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            )
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
@@ -1027,24 +1190,33 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # WEIGHT_SCALES
         if self.is_fp4_expert:
             fp4_block_k = 32
+            use_b12x_source_scale_dtype = get_moe_runner_backend().is_b12x()
+            scale_dtype = (
+                _b12x_fp4_source_scale_dtype()
+                if use_b12x_source_scale_dtype
+                else torch.float32
+            )
+            scale_init = torch.empty if use_b12x_source_scale_dtype else torch.ones
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
+                scale_init(
                     num_experts,
                     2 * intermediate_size_per_partition,
                     hidden_size // fp4_block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
+                scale_init(
                     num_experts,
                     hidden_size,
                     intermediate_size_per_partition // fp4_block_k,
-                    dtype=torch.float32,
+                    dtype=scale_dtype,
                 ),
                 requires_grad=False,
             )
+            w13_weight_scale.format_ue8m0 = use_b12x_source_scale_dtype
+            w2_weight_scale.format_ue8m0 = use_b12x_source_scale_dtype
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
         elif self.block_quant:
@@ -1194,9 +1366,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.contiguous(), (16, 16)
             )
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -1265,9 +1437,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ):
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 
-                assert isinstance(
-                    layer, DeepEPMoE
-                ), "DeepGemm MoE is only supported with DeepEPMoE"
+                assert isinstance(layer, DeepEPMoE), (
+                    "DeepGemm MoE is only supported with DeepEPMoE"
+                )
                 weight_block_size = self.quant_config.weight_block_size
                 requant_weight_ue8m0_inplace(
                     layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
@@ -1279,8 +1451,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
     def _prepare_b12x_fp4_expert_weights(self, layer: Module) -> None:
-        from b12x.cute.fp4 import swizzle_block_scale
-        from b12x.moe.fused.w4a16.prepare import prepare_w4a16_packed_weights
+        from b12x.moe.fused.w4a16.prepare import prepare_w4a16_modelopt_weights
 
         def _expand_native_scale(
             scale: torch.Tensor,
@@ -1288,18 +1459,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             expected_cols: int,
             name: str,
         ) -> torch.Tensor:
-            scale = scale.to(torch.float32)
-            if scale.shape[-1] == expected_cols // 2:
-                scale = scale.repeat_interleave(2, dim=-1)
-            elif scale.shape[-1] != expected_cols:
-                raise ValueError(
-                    f"{name} has {scale.shape[-1]} scale columns, expected "
-                    f"{expected_cols // 2} native-FP4 or {expected_cols} W4A16 columns"
-                )
-            return swizzle_block_scale(scale.to(torch.float8_e4m3fn)).contiguous()
+            return _expand_and_swizzle_b12x_fp4_scale(
+                scale,
+                expected_cols=expected_cols,
+                name=name,
+            ).contiguous()
 
-        w13_weight = layer.w13_weight.data.view(torch.uint8).contiguous()
-        w2_weight = layer.w2_weight.data.view(torch.uint8).contiguous()
+        w13_weight = layer.w13_weight.data.view(torch.uint8)
+        w2_weight = layer.w2_weight.data.view(torch.uint8)
+        if not w13_weight.is_contiguous() or not w2_weight.is_contiguous():
+            raise ValueError("b12x W4A16 modelopt weights must be contiguous")
         w13_cols = (w13_weight.shape[2] * 2) // 16
         w2_cols = (w2_weight.shape[2] * 2) // 16
         w13_scale = _expand_native_scale(
@@ -1317,7 +1486,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         num_experts = w13_weight.shape[0]
         w13_global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
         w2_global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
-        layer.b12x_w4a16_packed_weights = prepare_w4a16_packed_weights(
+        layer.b12x_w4a16_modelopt_weights = prepare_w4a16_modelopt_weights(
             w13_weight,
             w13_scale,
             w13_global_scale,
@@ -1327,17 +1496,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             activation="silu",
             params_dtype=getattr(layer, "b12x_moe_compute_dtype", torch.bfloat16),
             source_format="modelopt",
-            reuse_input_storage=True,
         )
+        del w13_scale, w2_scale, w13_global_scale, w2_global_scale
 
-        empty_u8 = torch.empty((0,), dtype=torch.uint8, device=device)
-        empty_scale = torch.empty((0,), dtype=torch.float8_e4m3fn, device=device)
-        copy_or_rebind_param(layer, "w13_weight", empty_u8)
-        copy_or_rebind_param(layer, "w2_weight", empty_u8)
-        copy_or_rebind_param(layer, "w13_weight_scale_inv", empty_scale)
-        copy_or_rebind_param(layer, "w2_weight_scale_inv", empty_scale)
-        layer.w13_weight_scale_inv.format_ue8m0 = False
-        layer.w2_weight_scale_inv.format_ue8m0 = False
+        copy_or_rebind_param(
+            layer,
+            "w13_weight_scale_inv",
+            torch.empty(
+                (0,),
+                dtype=layer.w13_weight_scale_inv.dtype,
+                device=device,
+            ),
+        )
+        copy_or_rebind_param(
+            layer,
+            "w2_weight_scale_inv",
+            torch.empty(
+                (0,),
+                dtype=layer.w2_weight_scale_inv.dtype,
+                device=device,
+            ),
+        )
+        layer.w13_weight_scale_inv.format_ue8m0 = True
+        layer.w2_weight_scale_inv.format_ue8m0 = True
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         copy_or_rebind_param(
             layer,
@@ -1361,7 +1544,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         layer.w13_input_scale = None
         layer.w2_input_scale = None
-        torch.cuda.empty_cache()
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
@@ -1704,9 +1886,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -1788,11 +1970,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # b12x W4A16 preparation swaps the raw fused rows before packing, while
-        # the kernel consumes first-half gate and second-half up activations.
-        # Load SGLang's raw tensor as [up, gate] so the packed kernel sees the
-        # checkpoint's official [gate=w1, up=w3] order.
-        return get_moe_runner_backend().is_b12x() and self.is_fp4_expert
+        # Direct b12x modelopt W4A16 kernels handle gated FC1 row rotation
+        # internally, so keep the checkpoint's [gate=w1, up=w3] row order.
+        return False
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
@@ -1900,7 +2080,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 activation=moe_runner_config.activation,
                 quant_mode="w4a16",
                 source_format="modelopt",
-                prepared_w4a16=getattr(layer, "b12x_w4a16_packed_weights", None),
+                prepared_w4a16=getattr(layer, "b12x_w4a16_modelopt_weights", None),
                 swiglu_limit=moe_runner_config.swiglu_limit,
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
                 workspace=workspace_pool,

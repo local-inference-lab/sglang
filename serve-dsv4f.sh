@@ -53,7 +53,7 @@ fi
   --tensor-parallel-size "${TP_SIZE:-2}" \
   --attention-backend dsv4 \
   --moe-runner-backend b12x \
-  --fp8-gemm-backend "${FP8_GEMM_BACKEND:-b12x}" \
+  --fp8-gemm-backend b12x \
   --fp4-gemm-backend b12x \
   --moe-a2a-backend none \
   --reasoning-parser deepseek-v4 \

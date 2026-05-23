@@ -514,13 +514,23 @@ class DeepseekV4AttnBackend(
             q_capacity = (q_capacity // 128) * 128
         return max(1, q_capacity)
 
+    @staticmethod
+    def _b12x_uses_chunked_prefill_workspace(forward_mode: ForwardMode) -> bool:
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
+            return False
+        return forward_mode.is_prefill(include_draft_extend_v2=True)
+
     def _b12x_prefill_q_capacity(
         self,
         *,
         forward_batch: ForwardBatch,
         q_rows: int,
     ) -> Optional[int]:
-        if not forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+        if not self._b12x_uses_chunked_prefill_workspace(
+            forward_batch.forward_mode
+        ):
             return None
         q_capacity = self._b12x_eager_extend_total_q_capacity()
         if int(q_rows) > q_capacity:
@@ -991,7 +1001,11 @@ class DeepseekV4AttnBackend(
         selected_width: int,
     ):
         fixed = self._use_b12x_fixed_workspace(forward_batch)
-        if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+        uses_chunked_prefill_workspace = self._b12x_uses_chunked_prefill_workspace(
+            forward_batch.forward_mode
+        )
+        max_fixed_q_rows = None
+        if uses_chunked_prefill_workspace:
             self._b12x_prefill_q_capacity(
                 forward_batch=forward_batch,
                 q_rows=q_rows,
@@ -1005,10 +1019,13 @@ class DeepseekV4AttnBackend(
                 )
             fixed = True
             q_rows = compressed_q_capacity
+        else:
+            max_fixed_q_rows = self._b12x_graph_q_rows_capacity()
         return self._get_b12x_compressed_mla_workspace(
             q_rows=q_rows,
             selected_width=selected_width,
             fixed=fixed,
+            max_fixed_q_rows=max_fixed_q_rows,
         )
 
     def _get_b12x_compressed_mla_workspace(
@@ -1017,6 +1034,7 @@ class DeepseekV4AttnBackend(
         q_rows: int,
         selected_width: int,
         fixed: bool,
+        max_fixed_q_rows: Optional[int] = None,
     ):
         from b12x.integration.mla import (
             B12XAttentionWorkspace,
@@ -1044,6 +1062,7 @@ class DeepseekV4AttnBackend(
                 q_rows=q_rows,
                 selected_width=selected_width,
                 split_chunks=split_chunks,
+                max_q_rows=max_fixed_q_rows,
             )
         if workspace is not None and not fixed:
             if (
@@ -1112,6 +1131,7 @@ class DeepseekV4AttnBackend(
         q_rows: int,
         selected_width: int,
         split_chunks: int,
+        max_q_rows: Optional[int] = None,
     ):
         candidates = []
         for (
@@ -1127,6 +1147,10 @@ class DeepseekV4AttnBackend(
             if num_q_heads != self.num_q_heads or index_num_q_heads != self.index_num_q_heads:
                 continue
             if int(getattr(workspace, "max_total_q", 0)) < q_rows:
+                continue
+            if max_q_rows is not None and int(
+                getattr(workspace, "max_total_q", 0)
+            ) > int(max_q_rows):
                 continue
             if int(getattr(workspace, "topk", 0)) < selected_width:
                 continue
@@ -1751,7 +1775,9 @@ class DeepseekV4AttnBackend(
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
         self.forward_metadata = metadata
-        if prefill_num_tokens is not None:
+        if prefill_num_tokens is not None and self._b12x_uses_chunked_prefill_workspace(
+            forward_batch.forward_mode
+        ):
             prefill_q_capacity = self._b12x_prefill_q_capacity(
                 forward_batch=forward_batch,
                 q_rows=prefill_num_tokens,
@@ -2123,7 +2149,9 @@ class DeepseekV4AttnBackend(
                 )
 
             q_rows = q.shape[0]
-            if forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
+            if self._b12x_uses_chunked_prefill_workspace(
+                forward_batch.forward_mode
+            ):
                 compressed_q_capacity = self._b12x_compressed_prefill_q_capacity()
                 if q_rows > compressed_q_capacity:
                     if (
