@@ -1970,9 +1970,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # Direct b12x modelopt W4A16 kernels handle gated FC1 row rotation
-        # internally, so keep the checkpoint's [gate=w1, up=w3] row order.
-        return False
+        # b12x W4A16 source tensors use [up=w3, gate=w1]. The packed prep and
+        # direct modelopt kernels both rotate that source into logical
+        # [gate, up] for the activation.
+        return get_moe_runner_backend().is_b12x() and self.is_fp4_expert
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         return TritonMoeQuantInfo(
