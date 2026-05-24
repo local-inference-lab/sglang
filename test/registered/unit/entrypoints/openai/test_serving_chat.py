@@ -29,6 +29,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -1342,6 +1343,34 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"thinking": True},
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_fallback_explicit_thinking_dsv_encoding_uses_env_default(self):
+        self._setup_fallback("deepseek-v4")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        req_disabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": False},
+        )
+        req_enabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+
+        for chat_encoding_spec in ("dsv4", "dsv32"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                with envs.SGLANG_DEFAULT_THINKING.override(True):
+                    self.assertTrue(self.chat._get_reasoning_from_request(req_default))
+                    self.assertFalse(
+                        self.chat._get_reasoning_from_request(req_disabled)
+                    )
+                    self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+                with envs.SGLANG_DEFAULT_THINKING.override(False):
+                    self.assertFalse(self.chat._get_reasoning_from_request(req_default))
 
     def test_fallback_explicit_enable_thinking_mode_default_off(self):
         self._setup_fallback("mimo")

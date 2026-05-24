@@ -1509,10 +1509,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
                 toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
+                template_kwargs = request.chat_template_kwargs or {}
+                if template_kwargs.get(toggle) is True:
+                    return True
+                if template_kwargs.get(toggle) is False:
+                    return False
+                if self.chat_encoding_spec in ("dsv4", "dsv32") and toggle == "thinking":
+                    return envs.SGLANG_DEFAULT_THINKING.get()
+                return False
             logger.warning(
                 "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
                 mode,
