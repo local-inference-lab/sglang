@@ -397,7 +397,7 @@ class VisionB12XAttention(nn.Module):
             raise Exception("VisionB12XAttention is only available for cuda")
         super().__init__()
         try:
-            from b12x.attention.contiguous.integration import (
+            from b12x.attention.contiguous import (
                 allocate_varlen_attention_workspace_for_plan,
                 b12x_varlen_attention_forward,
                 create_varlen_attention_plan,

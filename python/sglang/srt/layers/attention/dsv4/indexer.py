@@ -288,9 +288,9 @@ class C4IndexerBackendMixin:
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
 
-        from b12x.integration.paged_mqa_indexer import (
-            paged_mqa_index_decode_dense_topk_fp8,
-            paged_mqa_index_decode_supertile_topk_fp8,
+        from b12x.integration.compressed_indexer import (
+            compressed_index_decode_dense_topk_fp8,
+            compressed_index_decode_supertile_topk_fp8,
         )
 
         use_dense_decode = forward_batch.forward_mode.is_decode_or_idle()
@@ -301,7 +301,7 @@ class C4IndexerBackendMixin:
             logits_mode="dense" if use_dense_decode else "tiled",
         )
         if use_dense_decode:
-            paged_mqa_index_decode_dense_topk_fp8(
+            compressed_index_decode_dense_topk_fp8(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=c4_indexer_kv_cache,
@@ -320,7 +320,7 @@ class C4IndexerBackendMixin:
                 page_table_width=self._b12x_indexer_page_table_width_capacity(),
                 q_rows=workspace_q_rows,
             )
-            paged_mqa_index_decode_supertile_topk_fp8(
+            compressed_index_decode_supertile_topk_fp8(
                 q_fp8=q_fp8,
                 weights=weights,
                 index_k_cache=c4_indexer_kv_cache,

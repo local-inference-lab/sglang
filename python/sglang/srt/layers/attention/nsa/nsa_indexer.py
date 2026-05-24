@@ -216,7 +216,7 @@ def _try_b12x_persistent_paged_topk(
     topk: int,
     fused_output: bool,
 ) -> Optional[torch.Tensor]:
-    from b12x.integration.nsa_indexer import (
+    from b12x.integration.indexer import (
         run_persistent_topk2048,
         supports_persistent_topk2048,
     )
@@ -545,7 +545,7 @@ class Indexer(MultiPlatformOp):
         phantoms = getattr(self, "_b12x_indexer_phantoms", None)
         if phantoms is not None and phantoms.get("_max_q_rows", 0) >= q_rows:
             return phantoms
-        from b12x.integration.nsa_indexer import make_nsa_indexer_contract_phantoms
+        from b12x.integration.indexer import make_indexer_contract_phantoms
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # Upper bound on page table width: total KV pool pages.
@@ -553,7 +553,7 @@ class Indexer(MultiPlatformOp):
             layer_id=self.layer_id
         ).shape[0]
         max_q = max(q_rows, phantoms.get("_max_q_rows", 0)) if phantoms else q_rows
-        phantoms = make_nsa_indexer_contract_phantoms(
+        phantoms = make_indexer_contract_phantoms(
             max_q_rows=max_q,
             num_heads=self.n_heads,
             max_pages=max_pages,
@@ -572,9 +572,9 @@ class Indexer(MultiPlatformOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
-        from b12x.integration.nsa_indexer import (
-            NSAIndexerPagedDecodeMetadata,
-            sparse_nsa_index_decode_logits_paged,
+        from b12x.integration.indexer import (
+            IndexerPagedDecodeMetadata,
+            paged_decode_logits,
         )
 
         q_offset = min(sum(metadata.get_nsa_extend_len_cpu()), q_fp8.shape[0])
@@ -595,13 +595,13 @@ class Indexer(MultiPlatformOp):
         workspace = forward_batch.attn_backend.get_b12x_indexer_paged_workspace(
             forward_batch=forward_batch,
         )
-        logits = sparse_nsa_index_decode_logits_paged(
+        logits = paged_decode_logits(
             q_fp8=q_fp8[:q_offset],
             weights=weights[:q_offset],
             index_k_cache=forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=layer_id
             ),
-            metadata=NSAIndexerPagedDecodeMetadata(
+            metadata=IndexerPagedDecodeMetadata(
                 real_page_table=metadata.get_page_table_64()[:q_offset],
                 cache_seqlens_int32=seqlens_per_query,
                 paged_mqa_schedule_metadata=getattr(
@@ -662,9 +662,9 @@ class Indexer(MultiPlatformOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
-        from b12x.integration.nsa_indexer import (
-            NSAIndexerExtendLogitsMetadata,
-            sparse_nsa_index_extend_tiled_topk,
+        from b12x.integration.indexer import (
+            IndexerExtendMetadata,
+            extend_tiled_topk,
         )
         assert forward_batch.forward_mode.is_extend_without_speculative()
         if _is_hip:
@@ -721,11 +721,11 @@ class Indexer(MultiPlatformOp):
                 workspace.get_indexer_extend_candidate_buffers()
             )
 
-        raw_topk_result = sparse_nsa_index_extend_tiled_topk(
+        raw_topk_result = extend_tiled_topk(
             q_fp8=q_fp8[:q_offset],
             weights=weights[:q_offset],
             kv_fp8=kv_fp8,
-            metadata=NSAIndexerExtendLogitsMetadata(
+            metadata=IndexerExtendMetadata(
                 k_start=ks[:q_offset],
                 k_end=ke[:q_offset],
             ),
@@ -819,7 +819,7 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
-                schedule_metadata = deep_gemm_mod.get_paged_mqa_logits_metadata(
+                schedule_metadata = deep_gemm_mod.build_paged_mqa_schedule_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 

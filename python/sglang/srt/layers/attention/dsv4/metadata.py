@@ -146,23 +146,23 @@ class PagedIndexerMetadata:
         build_schedule: Optional[bool] = None,
         validate_raw_lengths: Optional[bool] = None,
     ) -> None:
-        from b12x.integration.paged_mqa_indexer import (
-            prepare_paged_mqa_indexer_metadata,
+        from b12x.integration.compressed_indexer import (
+            prepare_compressed_indexer_metadata,
         )
 
         if validate_raw_lengths is None:
             validate_raw_lengths = self.page_table.device.type != "cuda"
-        self.b12x_metadata = prepare_paged_mqa_indexer_metadata(
+        self.b12x_metadata = prepare_compressed_indexer_metadata(
             real_page_table=self.page_table,
             cache_seqlens_int32=self.c4_seq_lens,
             page_size=self.c4_page_size,
             expected_num_q_heads=self.expected_num_q_heads,
-            paged_mqa_schedule_metadata=self.b12x_schedule_metadata,
+            schedule_metadata=self.b12x_schedule_metadata,
             build_schedule=build_schedule,
             validate_raw_lengths=validate_raw_lengths,
             shared_page_table=self.shared_page_table,
         )
-        self.b12x_schedule_metadata = self.b12x_metadata.paged_mqa_schedule_metadata
+        self.b12x_schedule_metadata = self.b12x_metadata.schedule_metadata
 
     @property
     def c4_page_size(self) -> int:
@@ -193,7 +193,7 @@ class PagedIndexerMetadata:
         ):
             if _is_cuda_graph_capture_active(other_schedule.device):
                 raise RuntimeError(
-                    "b12x paged-MQA schedule metadata was not allocated before "
+                    "b12x compressed-indexer schedule metadata was not allocated before "
                     "CUDA graph capture"
                 )
             self.b12x_schedule_metadata = torch.empty_like(other_schedule)

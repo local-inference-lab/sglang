@@ -61,7 +61,7 @@ C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 B12X_COMPRESSED_MLA_HEAD_DIM = 512
 B12X_C4_INDEXER_TILE_BLOCK_K = 512
-B12X_C4_INDEXER_SUPERTILE_K_ENV = "B12X_PAGED_MQA_INDEX_SUPERTILE_K"
+B12X_C4_INDEXER_SUPERTILE_K_ENV = "B12X_COMPRESSED_INDEX_SUPERTILE_K"
 B12X_C4_INDEXER_SUPERTILE_K_DEFAULT = 1048576
 B12X_C4_INDEXER_UNSCHEDULED_MAX_PAGES = 1023
 B12X_C4_INDEXER_TILE_LOGITS_BUDGET_BYTES_ENV = (
@@ -730,7 +730,7 @@ class DeepseekV4AttnBackend(
         )
 
     def _build_b12x_attention_arena_caps(self):
-        from b12x.integration.mla import B12XAttentionArenaCaps
+        from b12x.attention.workspace import B12XAttentionArenaCaps
 
         graph_q_rows = self._b12x_graph_q_rows_capacity()
         prefill_chunk_q = self._b12x_eager_extend_total_q_capacity()
@@ -1036,7 +1036,7 @@ class DeepseekV4AttnBackend(
         fixed: bool,
         max_fixed_q_rows: Optional[int] = None,
     ):
-        from b12x.integration.mla import (
+        from b12x.attention.workspace import (
             B12XAttentionWorkspace,
             B12XAttentionWorkspaceContract,
         )
@@ -1344,7 +1344,7 @@ class DeepseekV4AttnBackend(
         if not fixed:
             return None
 
-        from b12x.integration.mla import B12XAttentionWorkspaceContract
+        from b12x.attention.workspace import B12XAttentionWorkspaceContract
 
         q_rows = max(int(q_rows), 1)
         page_table_width_capacity = self._b12x_indexer_page_table_width_capacity()

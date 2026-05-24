@@ -128,10 +128,10 @@ def _get_b12x_paged_mqa_logits_metadata(
     context_lens: torch.Tensor,
 ) -> Optional[torch.Tensor]:
     try:
-        from b12x.integration.nsa_indexer import get_paged_mqa_logits_metadata
+        from b12x.integration.indexer import build_paged_mqa_schedule_metadata
     except (ImportError, ModuleNotFoundError):
         return None
-    return get_paged_mqa_logits_metadata(context_lens, 64)
+    return build_paged_mqa_schedule_metadata(context_lens, 64)
 
 
 @dataclass(frozen=True)
@@ -633,7 +633,7 @@ class NativeSparseAttnBackend(
         return max(1, int(self.max_token_pool_size))
 
     def _build_b12x_attention_arena_caps(self):
-        from b12x.integration.mla import B12XAttentionArenaCaps
+        from b12x.attention.workspace import B12XAttentionArenaCaps
 
         extend_total_q = self._b12x_eager_extend_total_q_capacity()
         extend_topk_supertile_k = int(
@@ -762,7 +762,7 @@ class NativeSparseAttnBackend(
         mode: str,
         v_head_dim: int,
     ):
-        from b12x.integration.mla import B12XAttentionWorkspaceContract
+        from b12x.attention.workspace import B12XAttentionWorkspaceContract
 
         normalized_mode = self._normalize_b12x_workspace_mode(mode)
         requested_v_head_dim = max(int(v_head_dim), 1)
@@ -834,7 +834,7 @@ class NativeSparseAttnBackend(
                 mode="extend",
                 v_head_dim=int(self.b12x_workspace_v_head_dim),
             )
-            prewarm = getattr(workspace, "prewarm_nsa_extend_tiled_topk", None)
+            prewarm = getattr(workspace, "prewarm_indexer_extend_tiled_topk", None)
             if prewarm is not None:
                 prewarm()
             bundle.extend_tiled_topk_prewarmed = True
@@ -1088,7 +1088,7 @@ class NativeSparseAttnBackend(
         try:
             import deep_gemm
 
-            return deep_gemm.get_paged_mqa_logits_metadata(
+            return deep_gemm.build_paged_mqa_schedule_metadata(
                 context_lens, 64, deep_gemm.get_num_sms()
             )
         except (ImportError, ModuleNotFoundError, RuntimeError):
@@ -2249,7 +2249,7 @@ class NativeSparseAttnBackend(
         b12x_workspace = None
         if nsa_impl == "b12x":
             if selected_indices is None:
-                raise RuntimeError("b12x NSA extend requires topk indices")
+                raise RuntimeError("b12x indexer extend requires topk indices")
             extend_mode: Literal["extend", "target_verify", "draft_extend"]
             if forward_batch.forward_mode.is_target_verify():
                 extend_mode = "target_verify"
