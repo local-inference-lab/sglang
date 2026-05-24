@@ -485,7 +485,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             w2_fp4=self.experts.w2_weight,
             w2_blockscale=self.experts.w2_blockscale_swizzled,
             w2_alphas=self.experts.g2_alphas,
-            source_format="modelopt",
+            source_format="modelopt_nvfp4",
         )
         return b12x_sparse_moe_fp4(
             hidden_states,

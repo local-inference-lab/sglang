@@ -1325,19 +1325,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
             self_attn.setup_b12x_wo_projection()
 
-        token_counts = set()
-        server_args = get_global_server_args()
-        if server_args.cuda_graph_bs is not None:
-            graph_batch_sizes = [int(bs) for bs in server_args.cuda_graph_bs]
-            token_counts.update(bs for bs in graph_batch_sizes if bs > 0)
-            draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None)
-            if draft_tokens is not None and int(draft_tokens) > 0:
-                token_counts.update(
-                    bs * int(draft_tokens) for bs in graph_batch_sizes if bs > 0
-                )
-        chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
-        if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
-            token_counts.add(int(chunked_prefill_size))
+        from sglang.srt.layers.quantization.fp8 import (
+            _planned_b12x_block_fp8_token_counts,
+        )
+
+        token_counts = _planned_b12x_block_fp8_token_counts()
         if layers and token_counts:
             layers[0].self_attn.prewarm_b12x_wo_projection_workspaces(token_counts)
 

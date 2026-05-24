@@ -3257,6 +3257,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.split_index = next_split_index
         return ret
 
+    @staticmethod
+    def _prefill_power2_bucket(
+        num_tokens: int, chunked_prefill_size: Optional[int]
+    ) -> Optional[int]:
+        if chunked_prefill_size is None:
+            return None
+
+        tokens = int(num_tokens)
+        chunk_size = int(chunked_prefill_size)
+        if tokens <= 0 or chunk_size <= 0 or tokens >= chunk_size:
+            return None
+
+        bucket = max(16, 1 << (tokens - 1).bit_length())
+        bucket = min(bucket, chunk_size)
+        return bucket if bucket > tokens else None
+
+    def _maybe_pad_b12x_block_fp8_prefill(self, forward_batch: ForwardBatch) -> None:
+        if getattr(self.server_args, "fp8_gemm_runner_backend", None) != "b12x":
+            return
+        if forward_batch.global_num_tokens_cpu is not None:
+            return
+        if forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            return
+        if (
+            forward_batch.input_ids is None
+            or forward_batch.positions is None
+            or forward_batch.out_cache_loc is None
+            or forward_batch.input_embeds is not None
+            or forward_batch.replace_embeds is not None
+        ):
+            return
+
+        real_num_tokens = int(forward_batch.num_token_non_padded_cpu or 0)
+        padded_num_tokens = self._prefill_power2_bucket(
+            real_num_tokens,
+            getattr(self.server_args, "chunked_prefill_size", None),
+        )
+        if padded_num_tokens is None:
+            return
+        if int(forward_batch.input_ids.shape[0]) >= padded_num_tokens:
+            return
+
+        forward_batch._pad_inputs_to_size(
+            self, padded_num_tokens, forward_batch.batch_size
+        )
+
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -3380,6 +3426,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+
+        self._maybe_pad_b12x_block_fp8_prefill(forward_batch)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (

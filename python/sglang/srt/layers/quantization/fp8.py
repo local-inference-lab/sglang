@@ -135,89 +135,7 @@ def _b12x_fp4_source_scale_dtype() -> torch.dtype:
     return dtype
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def _empty_e4m3_tensor(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-    storage = torch.empty(shape, dtype=torch.uint8, device=device)
-    storage.zero_()
-    return storage.view(torch.float8_e4m3fn)
-
-
-def _to_e4m3_scale_chunk(scale: torch.Tensor) -> torch.Tensor:
-    if scale.dtype == torch.float8_e4m3fn:
-        return scale
-    if scale.dtype == torch.float32:
-        return scale.to(torch.float8_e4m3fn)
-    return scale.to(torch.float32).to(torch.float8_e4m3fn)
-
-
-def _expand_and_swizzle_b12x_fp4_scale(
-    scale: torch.Tensor,
-    *,
-    expected_cols: int,
-    name: str,
-) -> torch.Tensor:
-    if scale.ndim == 2:
-        scale = scale.unsqueeze(0)
-        squeeze_batch = True
-    elif scale.ndim == 3:
-        squeeze_batch = False
-    else:
-        raise ValueError(f"{name} must be 2D or 3D, got {tuple(scale.shape)}")
-
-    batch, rows, source_cols = (int(dim) for dim in scale.shape)
-    if source_cols == expected_cols // 2 and expected_cols % 2 == 0:
-        expand_native_cols = True
-    elif source_cols == expected_cols:
-        expand_native_cols = False
-    else:
-        raise ValueError(
-            f"{name} has {source_cols} scale columns, expected "
-            f"{expected_cols // 2} native-FP4 or {expected_cols} W4A16 columns"
-        )
-
-    rows_padded = _align_up(rows, 128)
-    cols_padded = _align_up(expected_cols, 4)
-    swizzled = _empty_e4m3_tensor((batch, rows_padded, cols_padded), scale.device)
-    swizzled_view = swizzled.reshape(
-        batch,
-        rows_padded // 128,
-        cols_padded // 4,
-        32,
-        4,
-        4,
-    )
-
-    block_storage = torch.empty(
-        (128, cols_padded), dtype=torch.uint8, device=scale.device
-    )
-    block = block_storage.view(torch.float8_e4m3fn)
-    for expert in range(batch):
-        expert_scale = scale[expert]
-        for block_id, row_start in enumerate(range(0, rows_padded, 128)):
-            row_end = min(row_start + 128, rows)
-            valid_rows = max(row_end - row_start, 0)
-            block_storage.zero_()
-            if valid_rows:
-                source = expert_scale[row_start:row_end]
-                source = _to_e4m3_scale_chunk(source)
-                if expand_native_cols:
-                    block[:valid_rows, :expected_cols:2].copy_(source)
-                    block[:valid_rows, 1:expected_cols:2].copy_(source)
-                else:
-                    block[:valid_rows, :expected_cols].copy_(source)
-            swizzled_view[expert, block_id].copy_(
-                block.reshape(4, 32, cols_padded // 4, 4).permute(2, 1, 0, 3)
-            )
-
-    return swizzled[0] if squeeze_batch else swizzled
-
-
-def _planned_b12x_block_fp8_token_counts(
-    *, include_chunked_prefill: bool
-) -> Tuple[int, ...]:
+def _planned_b12x_block_fp8_token_counts() -> Tuple[int, ...]:
     from sglang.srt.server_args import get_global_server_args
 
     try:
@@ -236,10 +154,14 @@ def _planned_b12x_block_fp8_token_counts(
     if draft_tokens is not None and int(draft_tokens) > 0:
         token_counts.update(bs * int(draft_tokens) for bs in graph_batch_sizes)
 
-    if include_chunked_prefill:
-        chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
-        if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
-            token_counts.add(int(chunked_prefill_size))
+    chunked_prefill_size = getattr(server_args, "chunked_prefill_size", None)
+    if chunked_prefill_size is not None and int(chunked_prefill_size) > 0:
+        chunked_prefill_size = int(chunked_prefill_size)
+        power2_tokens = 1
+        while power2_tokens <= chunked_prefill_size:
+            token_counts.add(power2_tokens)
+            power2_tokens <<= 1
+        token_counts.add(chunked_prefill_size)
 
     return tuple(sorted(token_counts))
 
@@ -249,11 +171,6 @@ def _b12x_block_fp8_output_dtype(layer: Module) -> torch.dtype:
     if dtype in (torch.bfloat16, torch.float16):
         return dtype
     return torch.bfloat16
-
-
-def _b12x_block_fp8_uses_chunked_prefill(layer: Module) -> bool:
-    # Prefill logits are computed from pruned hidden states, not every chunk row.
-    return layer.__class__.__name__ != "ParallelLMHead"
 
 
 class Fp8Config(QuantizationConfig):
@@ -685,9 +602,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             layer.b12x_block_fp8_linear_weight = packed_weight
             layer.weight.b12x_block_fp8_linear_weight = packed_weight
-            token_counts = _planned_b12x_block_fp8_token_counts(
-                include_chunked_prefill=_b12x_block_fp8_uses_chunked_prefill(layer)
-            )
+            token_counts = _planned_b12x_block_fp8_token_counts()
             if token_counts:
                 device = packed_weight.weight.values.device
                 device_index = device.index if device.index is not None else 0
@@ -1451,54 +1366,42 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
     def _prepare_b12x_fp4_expert_weights(self, layer: Module) -> None:
-        from b12x.moe.fused.w4a16.prepare import prepare_w4a16_modelopt_weights
-
-        def _expand_native_scale(
-            scale: torch.Tensor,
-            *,
-            expected_cols: int,
-            name: str,
-        ) -> torch.Tensor:
-            return _expand_and_swizzle_b12x_fp4_scale(
-                scale,
-                expected_cols=expected_cols,
-                name=name,
-            ).contiguous()
+        from b12x.moe.fused.w4a16.prepare import prepare_w4a16_mxfp4_native_weights
 
         w13_weight = layer.w13_weight.data.view(torch.uint8)
         w2_weight = layer.w2_weight.data.view(torch.uint8)
         if not w13_weight.is_contiguous() or not w2_weight.is_contiguous():
-            raise ValueError("b12x W4A16 modelopt weights must be contiguous")
-        w13_cols = (w13_weight.shape[2] * 2) // 16
-        w2_cols = (w2_weight.shape[2] * 2) // 16
-        w13_scale = _expand_native_scale(
-            layer.w13_weight_scale_inv.data,
-            expected_cols=w13_cols,
-            name="w13_weight_scale_inv",
-        )
-        w2_scale = _expand_native_scale(
-            layer.w2_weight_scale_inv.data,
-            expected_cols=w2_cols,
-            name="w2_weight_scale_inv",
-        )
+            raise ValueError("b12x W4A16 native MXFP4 weights must be contiguous")
 
         device = w13_weight.device
         num_experts = w13_weight.shape[0]
         w13_global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
         w2_global_scale = torch.ones(num_experts, dtype=torch.float32, device=device)
-        layer.b12x_w4a16_modelopt_weights = prepare_w4a16_modelopt_weights(
+        layer.b12x_w4a16_mxfp4_native_weights = prepare_w4a16_mxfp4_native_weights(
             w13_weight,
-            w13_scale,
+            layer.w13_weight_scale_inv.data,
             w13_global_scale,
             w2_weight,
-            w2_scale,
+            layer.w2_weight_scale_inv.data,
             w2_global_scale,
             activation="silu",
             params_dtype=getattr(layer, "b12x_moe_compute_dtype", torch.bfloat16),
-            source_format="modelopt",
+            reuse_input_storage=True,
         )
-        del w13_scale, w2_scale, w13_global_scale, w2_global_scale
+        del w13_global_scale, w2_global_scale
 
+        # The prepared W4A16 buffers alias and overwrite the loaded native MXFP4
+        # weight storage. Rebind the source params so fallback use fails closed.
+        copy_or_rebind_param(
+            layer,
+            "w13_weight",
+            torch.empty((0,), dtype=layer.w13_weight.dtype, device=device),
+        )
+        copy_or_rebind_param(
+            layer,
+            "w2_weight",
+            torch.empty((0,), dtype=layer.w2_weight.dtype, device=device),
+        )
         copy_or_rebind_param(
             layer,
             "w13_weight_scale_inv",
@@ -1970,9 +1873,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # b12x W4A16 source tensors use [up=w3, gate=w1]. The packed prep and
-        # direct modelopt kernels both rotate that source into logical
-        # [gate, up] for the activation.
+        # b12x W4A16 preparation rotates the native [up=w3, gate=w1] source
+        # tensors into logical [gate, up] for the activation.
         return get_moe_runner_backend().is_b12x() and self.is_fp4_expert
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
@@ -2050,6 +1952,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             topk_output = dispatch_output.topk_output
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            if topk_ids.dtype != torch.int32:
+                raise TypeError(
+                    f"b12x W4A16 requires topk_ids dtype torch.int32, got {topk_ids.dtype}"
+                )
 
             output_dtype = x.dtype
             with use_symmetric_memory(
@@ -2080,8 +1986,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
                 activation=moe_runner_config.activation,
                 quant_mode="w4a16",
-                source_format="modelopt",
-                prepared_w4a16=getattr(layer, "b12x_w4a16_modelopt_weights", None),
+                source_format="mxfp4_native",
+                prepared_w4a16=getattr(layer, "b12x_w4a16_mxfp4_native_weights", None),
                 swiglu_limit=moe_runner_config.swiglu_limit,
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
                 workspace=workspace_pool,

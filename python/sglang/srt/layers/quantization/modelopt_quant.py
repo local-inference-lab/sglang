@@ -2426,7 +2426,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 topk_ids=topk_ids,
                 activation=activation,
                 quant_mode=quant_mode,
-                source_format="modelopt",
+                source_format="modelopt_nvfp4",
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
                 workspace=workspace_pool,
                 output=symm_output,
